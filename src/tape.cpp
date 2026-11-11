@@ -61,6 +61,7 @@ void Tape::detach() {
 void Tape::clear() {
     ops_.clear();
     contents_.clear();
+    copies_.clear();
     blocks_.clear();
     block_ = -1;
 }
@@ -119,6 +120,26 @@ void Tape::record(const RadIssueOp& issue) {
         op.written = o.written != 0;
         op.in_place = o.inout != 0;
         rec.operands.push_back(std::move(op));
+        if (keep_ && o.data != nullptr) {
+            // bytes is 0 where the ABI says the operand is not one span: an op that views its
+            // buffer with a shape whose dim 0 it narrows. The declared shape still sizes the rows
+            // the issue uses, so a copy of them is the slice the op addressed as long as the
+            // view is dense, which is what a copy has to assume. A reader that asked for copies is
+            // the one that can tell: its comparison is against these bytes.
+            int64_t bytes = o.bytes;
+            if (bytes <= 0 && o.rank >= 2 && o.rows > 0) {
+                int64_t n = 1;
+                for (uint8_t d = 1; d < o.rank; ++d) n *= o.shape[d];
+                bytes = rad_dtype_bytes(o.dtype, o.rows * n);
+            }
+            if (bytes > 0) {
+                const auto* from = static_cast<const uint8_t*>(o.data);
+                copies_.emplace_back(from, from + bytes);
+                content.push_back(OperandContent{copies_.back().data(),
+                                                 static_cast<size_t>(bytes), o.name != nullptr});
+                continue;
+            }
+        }
         content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes), o.name != nullptr});
     }
 

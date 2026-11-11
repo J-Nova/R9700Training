@@ -86,7 +86,11 @@ exchanged" — the middle two dwords of each sixteen-byte step are exchanged, ho
 column order. `lora_shrink` reads codes by column, so an adapter over a step-order site would be
 wrong — which is why radiance refuses it (see §3). The first patch lifts this refusal *by
 unexchanging the middle dwords when it builds `x`* for the step-order dtypes, and the
-`i8a8h` sites of this contract need only the column-order path above.
+`i8a8h` sites of this contract need only the column-order path above. What says which order a
+shrink's codes are in is the encoding of the GEMM whose activation it reads, so the patch has the
+core declare `lora_shrink` with a `gemm_dtype` parameter holding that GEMM's own `dtype` string
+(`i8a8h`, `w8a8`, ...). `dtype` alone cannot: it is the activation's element dtype, `i8` at every
+coded site.
 
 ---
 
@@ -168,7 +172,12 @@ if (w.enc_known && w.enc.transform[0])
 
 The patch lifts them for sites that satisfy the conditions of §1 and §4: the adapter declares
 `"radiance_input_basis": "fwht128"` and every targeted site is an `i8a8h` (or, after patch 1,
-step-order) `gemm_nt_q`. **Staying** (no patch touches these):
+step-order) `gemm_nt_q`. Lifting refusal 1 is the shrink's business: what order a row's codes are in
+is the reading GEMM's encoding, so the patch declares `lora_shrink` with a `gemm_dtype` (§1.1) and
+the rows that can read the step order exchange it back. `libref`'s and `libavx`'s rows do;
+`libr4d`'s and `libhalo`'s rows read a row's codes by column, so they refuse a step-order reading by
+name (`RAD_E_UNSUPPORTED`) rather than fold the codes of the wrong columns. The `i8a8h` sites of
+this trunk read column order, and run on both. **Staying** (no patch touches these):
 
 - the rotated-parts refusal `lora.cpp:599-601` — `gemm_nt_q` over rotated parts (`pb1`/`pb2`),
   which is the IQR-style decode, not an adapter site;
@@ -207,7 +216,10 @@ adapter/
 - **Without the key, radiance refuses the adapter on a transformed trunk, as today** — the
   refusal stays exactly as quoted in §3. The key on a non-transformed trunk (bf16, plain `i8a8`)
   must also be refused: the file claims a basis the sites do not have. Both checks live in the
-  site-filter patch.
+  site-filter patch, and they run for an adapter loaded after startup too: `Engine::lora_load`
+  and `lora_set_weights` end in `lora::check_placed`, which runs the site filter again with the
+  loaded adapter's basis, so a keyless adapter is refused there with the same message instead of
+  being placed on the rotated trunk.
 
 Defaults the trainer writes (PEFT spellings): `r: 16` — radiance's own
 `--max-lora-rank` default is 16 (`core/lora/config.h:31`, `kDefaultRank`), `lora_alpha: 32` (so every site's scale is `32/16 = 2.0`),

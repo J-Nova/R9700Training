@@ -1,12 +1,13 @@
-// tests/support/self_check.h -- a host test file that brings no main() of its own.
+// tests/support/self_check.h -- a host test file that runs itself from a static initializer.
 //
 // The host tests are one binary, collected from tests/host/*.cpp, and its entry point belongs to
-// tests/host/vector_tape.cpp (issue #1); a second main() would not link, and that file is not this
-// issue's to change. So a test file runs itself from a static initializer instead, which the binary
-// reaches before that main: R97_SELF_CHECK names the function, it is run once with its name
-// printed, and a check that fails prints its expression and location and aborts, which is what
-// makes the binary exit non-zero and ctest report it. When the tier's own runner takes the entry
-// point over, an R97_SELF_CHECK line becomes one registration and nothing else changes.
+// tests/host/main.cpp; a second main() would not link. A file that writes R97_SELF_CHECK instead
+// of an R97_TEST registration runs its check from a static initializer, which the binary reaches
+// before that main: the check runs once with its name printed, and a failure prints its expression
+// and location and aborts, which is what makes the binary exit non-zero and ctest report it. New
+// tests register with R97_TEST (tests/support/test.h), which the tier's runner runs before static
+// teardown; converting a file that still says R97_SELF_CHECK is turning its line into that
+// registration and nothing else.
 //
 // CHECK is a real check, not assert(): the project builds RelWithDebInfo, where -DNDEBUG makes
 // assert() compile out and a check that never runs passes.

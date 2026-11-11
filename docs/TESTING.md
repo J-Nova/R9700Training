@@ -3,7 +3,7 @@
 Three test labels, and the variables that run them. ctest runs each tier's binary; the sources are
 globs of their directories (`tests/<tier>/*.cpp`), so a new test file needs no edit anywhere, and
 the tests inside one binary register themselves with `R97_TEST(name)` (`tests/support/test.h`).
-Each tier's binary holds one `main` in its own directory: `tests/host/vector_tape.cpp`,
+Each tier's binary holds one `main` in its own directory: `tests/host/main.cpp`,
 `tests/gpu/main.cpp`, `tests/model/info_meta.cpp`. Checks are `R97_CHECK`, not
 `assert`: the default build is `RelWithDebInfo`, which defines `NDEBUG` and compiles `assert` out.
 
@@ -138,7 +138,8 @@ hf download StillDeadcode/qwen3.8-27b-iqr-v4 qwen3.8-27b-iq4r-s-v4.rad
   To see two copies serialise, start two: `./build/r97_gpu_tests & ./build/r97_gpu_tests & wait`.
 - The guard holds a lock, never ownership: it never stops a process it did not start. If a stale
   holder is wedged, kill only processes you started.
-- `r97_gpu_tests` runs its tests from `main`, not from the at-exit runner the host and model tiers
-  use (`tests/gpu/main.cpp` says why: a device test `dlopen`s `libr97.so`, and a handler armed
-  during static initialisation would register the plugin's rows after the r97 registry they go
-  into is destroyed). `tests/gpu/adjoint_add.cpp` is the example of a device test.
+- `r97_gpu_tests` runs its tests from `main` (so does `r97_host_tests`), not from the at-exit
+  runner `tests/support/test.h` arms, which only the model tier uses (`tests/gpu/main.cpp` says
+  why: a device test `dlopen`s `libr97.so`, and a handler armed during static initialisation would
+  register the plugin's rows after the r97 registry they go into is destroyed).
+  `tests/gpu/adjoint_add.cpp` is the example of a device test.

@@ -37,6 +37,7 @@ replay tests by name. See `docs/reports/2026-11-11-patch-audit.md`.
 | --- | --- | --- | --- | --- | --- | --- |
 | `patches/serving/0201-lora-set-weights.patch` | serving | 75 | 0 | 85 | not-submitted | put an adapter slot in service from factors already in memory, not only from a directory |
 | `patches/serving/0201-narrow-head-gate.patch` | serving | 6 | 3 | 15 | not-submitted | an int8 attention gate on a head narrower than the 128-column quantiser group |
+| `patches/serving/0210-lora-int8-trunk-host.patch` | serving | 290 | 28 | 325 | not-submitted | a LoRA adapter on the rotated int8 trunk, through the host kernels |
 | `patches/training/0101-issue-observer.patch` | training | 154 | 0 | 170 | not-submitted | an optional issue observer and layer block brackets on the runtime context |
 | `patches/training/0102-replay-block.patch` | training | 114 | 19 | 150 | not-submitted | re-running one block of a step from a restored residual, after its ops have run |
 | `patches/training/0103-prefill-logits.patch` | training | 201 | 20 | 240 | not-submitted | a training-fixture prefill that keeps every position's logits, driven through the engine |
