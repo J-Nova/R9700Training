@@ -640,8 +640,11 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                                          first_rows(*below, tokens, meta.hidden)};
         }
 
-        fill_missing_grads(grads, params);
+        // The split runs first: a fused weight's engine gradient is named after the container's
+        // weight ("@fused:..."), so filling the missing ones before splitting would add a zero
+        // under every module name the split then adds the real gradient for.
         split_adapter_grads(grads, groups);
+        fill_missing_grads(grads, params);
         if (report) *report = std::move(measured);
         return result;
     };
