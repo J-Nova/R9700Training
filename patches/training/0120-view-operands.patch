@@ -1,0 +1,52 @@
+Concern: the issue record names a narrowing view but not where its values are
+Upstream: not-submitted
+
+An issue operand carries the declared shape, the row window and a byte count that is zero when the
+operand is not one span (0101). A kernel that receives a strided tensor -- the GDN conv prep reads
+its gate and beta as two four-column views of the fused 136-wide input, and the q norm reads the
+query half of an interleaved q|gate buffer -- records the declared buffer and no offset. A
+consumer that must copy those values (the training tape keeps them for the backward) cannot tell
+which elements the kernel saw: it has the row window and nothing else. This adds the tensor the
+kernel actually receives as its own rank, shape, strides and element offset from the declared
+buffer, for the strided case only, so a contiguous operand still reads as one span.
+
+--- a/abi/rad_runtime.h
++++ b/abi/rad_runtime.h
+@@ -934,6 +934,14 @@
+     int64_t  shape[RAD_MAX_RANK]; /* the declared shape, before this issue narrows dim 0 */
+     int64_t  offset;       /* element offset into the buffer or weight, as issued */
+     int64_t  rows;         /* dim 0 extent this issue uses; 0 means the declared extent */
++    /* The tensor the kernel receives, when it is not the declared one: a view narrows dim 0, or
++     * strides the last axis (the q norm reads the query half of the interleaved q|gate buffer).
++     * `view_off` is its first element's offset from the declared buffer's, and `view_stride` the
++     * strides into the declared layout. `bytes` is 0 for such a view: it is not one span. */
++    uint8_t  view_rank;
++    int64_t  view_shape[RAD_MAX_RANK];
++    int64_t  view_stride[RAD_MAX_RANK];
++    int64_t  view_off;
+     uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
+     uint8_t  inout;        /* 1 for RAD_OPD_INOUT, whose previous value the kernel also reads */
+ } RadIssueOperand;
+
+--- a/core/runtime/issue.cpp
++++ b/core/runtime/issue.cpp
+@@ -1365,6 +1365,19 @@
+         }
+         /* A KV operand's offset is its layer, not an element offset. */
+         if (o.kind == RAD_OPK_KV) e.offset = 0;
++        /* The view the kernel actually receives, when it is not the declared tensor; a consumer
++         * that has to copy the operand's values cannot read them as one span. */
++        if (full && o.kind == RAD_OPK_BUF && full->rank > 0 &&
++            !rad_tensor_is_contiguous(&t[i])) {
++            e.view_rank = (uint8_t)t[i].rank;
++            for (uint32_t d = 0; d < t[i].rank && d < RAD_MAX_RANK; ++d) {
++                e.view_shape[d]  = t[i].shape[d];
++                e.view_stride[d] = t[i].stride[d];
++            }
++            const int64_t es = rad_dtype_bytes(t[i].dtype, 1);
++            if (es > 0 && rad_dtype_bits(t[i].dtype) % 8 == 0 && t[i].data && full->data)
++                e.view_off = ((const uint8_t*)t[i].data - (const uint8_t*)full->data) / es;
++        }
+         if (o.kind != RAD_OPK_WTAB && rad_tensor_is_contiguous(&t[i]))
+             e.bytes = rad_dtype_bytes(t[i].dtype, rad_tensor_numel(&t[i]));
+         const int role = (p.info && p.info->schema && i < p.info->schema->n_operands)

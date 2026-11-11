@@ -44,6 +44,7 @@ replay tests by name. See `docs/reports/2026-11-11-patch-audit.md`.
 | `patches/training/0104-prefill-lora.patch` | training | 16 | 0 | 25 | not-submitted | let the fixture prefill run one named adapter slot, so an in-memory update is one step away |
 | `patches/training/0105-prefill-not-sampled.patch` | training | 38 | 8 | 55 | not-submitted | a prefill that draws no token -- no sampler op, and a prompt of exactly the context fits |
 | `patches/training/0119-issue-observer-hook.patch` | training | 12 | 0 | 20 | not-submitted | the training tape attaches to a RadCtx, and the Engine is the only owner of it |
+| `patches/training/0120-view-operands.patch` | training | 21 | 0 | 25 | not-submitted | the issue record names a narrowing view but not where its values are |
 
 Every patch is `not-submitted` at this pin. None is `merged`: none is in radiance's `origin/main`.
 Moving one to `open` or `merged` changes only its own row and `Upstream:` line, in the pull request

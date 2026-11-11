@@ -23,6 +23,13 @@ struct Operand {
     int64_t rows = 0;           // how many rows this op touches; 0 = none/whole-buffer op
     bool written = false;       // read (false) or written (true)
     bool in_place = false;      // a write that also reads the value it replaces
+    // The tensor the kernel received, when it is not the declared one (a view narrows dim 0 or
+    // strides the last axis, as the q norm does over the interleaved q|gate buffer). Empty for a
+    // dense operand. `view_stride` is in elements of the declared layout, and `view_off` is the
+    // view's first element's offset from the declared buffer's.
+    std::vector<int64_t> view_shape;
+    std::vector<int64_t> view_stride;
+    int64_t view_off = 0;
 };
 
 struct OpRecord {

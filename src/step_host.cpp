@@ -6,9 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
-#include <cstdio>
 #include <map>
 #include <memory>
 #include <set>
@@ -91,10 +89,43 @@ double read_elem(const std::string& dtype, const void* data, int64_t i) {
 // the full buffer with the untouched rows zero.
 AdValue snapshot(const Operand& op, const OperandContent& content) {
     AdValue v;
+    // A strided or narrowed read -- the q norm and the gate read the two halves of the q|gate
+    // projection, the gated-delta layer reads q|k|v out of one fused projection -- is packed over
+    // its own shape: the adjoint that follows normalises the last dim the kernel normalised, and
+    // the declared buffer's last dim is not that one. backward.cpp scatters the cotangent back.
+    if (!op.view_shape.empty()) {
+        v.shape = op.view_shape;
+        const int64_t es = elem_size(op.dtype);
+        if (es == 0)
+            throw std::runtime_error("host step: cannot snapshot operand dtype '" + op.dtype + "'");
+        int64_t n = 1;
+        for (int64_t d : v.shape) n *= std::max<int64_t>(d, 0);
+        v.value.assign(static_cast<size_t>(std::max<int64_t>(n, 0)), 0.0);
+        if (!content.data || n == 0) return v;
+        const auto* base = static_cast<const uint8_t*>(content.data);
+        int64_t idx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const size_t rank = op.view_shape.size();
+        // A kept copy of a strided view is the view's own values, packed in its own order (the
+        // tape cannot copy a stride out of one span); a live buffer still has to be walked with
+        // the strides. The size tells which one this is.
+        const bool packed = content.bytes >= static_cast<size_t>(n) * static_cast<size_t>(es);
+        for (int64_t e = 0; e < n; ++e) {
+            int64_t off = packed ? e : op.view_off;
+            if (!packed)
+                for (size_t d = 0; d < rank; ++d) off += idx[d] * op.view_stride[d];
+            v.value[static_cast<size_t>(e)] = read_elem(op.dtype, base + static_cast<int64_t>(es) * off, 0);
+            for (size_t d = rank; d-- > 0;) {
+                if (++idx[d] < op.view_shape[d]) break;
+                idx[d] = 0;
+            }
+        }
+        return v;
+    }
     v.shape = op.shape;
     const int64_t total = numel(op.shape);
     v.value.assign(static_cast<size_t>(std::max<int64_t>(total, 0)), 0.0);
-    if (!content.data || content.bytes == 0 || total == 0) return v;
+    if (!content.data || total == 0) return v;
+    if (content.bytes == 0) return v;
 
     const int64_t es = elem_size(op.dtype);
     if (es == 0)
@@ -155,6 +186,8 @@ void tighten_operand(Operand& o) {
     if (o.rows <= 0 || o.shape.empty() || o.rows > o.shape[0]) return;
     o.shape[0] = o.rows;
     o.row_lo = 0;
+    // A view's first dim is the same row axis, so it narrows with the buffer.
+    if (!o.view_shape.empty() && o.rows <= o.view_shape[0]) o.view_shape[0] = o.rows;
 }
 
 void tighten_rows(OpRecord& rec) {

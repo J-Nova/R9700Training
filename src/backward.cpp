@@ -223,6 +223,28 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         v.live = false;
     };
 
+    // A view operand is snapped packed over its own shape (see snapshot in step_host.cpp); its
+    // cotangent comes back the same way. Scatter it into the layout the buffer's other readers and
+    // writers add up in, so the projection that wrote the buffer sees what it contributed.
+    const auto dense_view = [](const Operand& op, const std::vector<double>& view,
+                               int64_t rows, int64_t cols) {
+        if (op.view_shape.empty() || cols <= 0) return std::vector<double>();
+        std::vector<double> full(static_cast<size_t>(std::max<int64_t>(rows * cols, 0)), 0.0);
+        const size_t rank = op.view_shape.size();
+        std::vector<int64_t> idx(rank, 0);
+        for (size_t e = 0; e < view.size(); ++e) {
+            int64_t flat = op.view_off;
+            for (size_t d = 0; d < rank; ++d) flat += idx[d] * op.view_stride[d];
+            if (flat >= 0 && flat < static_cast<int64_t>(full.size()))
+                full[static_cast<size_t>(flat)] += view[e];
+            for (size_t d = rank; d-- > 0;) {
+                if (++idx[d] < op.view_shape[d]) break;
+                idx[d] = 0;
+            }
+        }
+        return full;
+    };
+
     // Add the rows [lo, hi) of a full-buffer, row-major tensor into a version's written rows.
     const auto add_version_full = [&](Version& v, int64_t lo, int64_t hi,
                                       const std::vector<double>& full) {
@@ -354,7 +376,11 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             if (!v)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        " has no snapshot for operand '" + rec.operands[j].buffer + "'");
-            if (v->shape != rec.operands[j].shape)
+            // A view operand is snapped as the kernel saw it: its own shape, not the buffer's.
+            const std::vector<int64_t>& want = rec.operands[j].view_shape.empty()
+                                                   ? rec.operands[j].shape
+                                                   : rec.operands[j].view_shape;
+            if (v->shape != want)
                 refuse("op '" + rec.op + "' at position " + std::to_string(rec.position) +
                        ": operand '" + rec.operands[j].buffer + "' is snapped with another shape");
             if (v->value.size() != static_cast<size_t>(numel(v->shape)))
@@ -442,16 +468,19 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             if (frozen_at.count(j)) continue;
             const int64_t bi = plan.by_name.at(rec.operands[j].buffer);
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];
-            if (dc[j].value.size() != static_cast<size_t>(b.rows * b.cols))
+            const std::vector<double> dense = dense_view(rec.operands[j], dc[j].value, b.rows,
+                                                         b.cols);
+            const std::vector<double>& values = dense.empty() ? dc[j].value : dense;
+            if (values.size() != static_cast<size_t>(b.rows * b.cols))
                 refuse("op '" + rec.op + "': adjoint left operand '" + rec.operands[j].buffer +
-                       "' with " + std::to_string(dc[j].value.size()) + " values, not " +
+                       "' with " + std::to_string(values.size()) + " values, not " +
                        std::to_string(b.rows * b.cols));
             for (const Segment& seg : plan.read_segments[i][j]) {
                 if (seg.version >= 0)
                     add_version_full(b.versions[static_cast<size_t>(seg.version)], seg.row_lo,
-                                     seg.row_hi, dc[j].value);
+                                     seg.row_hi, values);
                 else
-                    add_input_full(b, seg.row_lo, seg.row_hi, dc[j].value);
+                    add_input_full(b, seg.row_lo, seg.row_hi, values);
             }
         }
     }
