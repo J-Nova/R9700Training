@@ -114,6 +114,17 @@ std::string grad_name(const char* prefix, const char* leaf) {
     return std::string(prefix) + "." + leaf;
 }
 
+/* A record that covers several sites of a fused weight (the lora slot operand) names each site's
+ * gradient with the join's slot prefix; without one every slot uses the record's prefix. */
+std::string slot_grad_name(const AdjointCall& call, int64_t slot, const char* leaf) {
+    std::string prefix = call.prefix ? call.prefix : "";
+    if (call.slot_prefix) {
+        const std::string site = call.slot_prefix(slot);
+        if (!site.empty()) prefix = site;
+    }
+    return grad_name(prefix.c_str(), leaf);
+}
+
 /* bf16 rounding, which lora_expand_mm's twin needs and r97's own arithmetic never does. Ties go to
  * the even significand and a value below bf16's normal range flushes, as rad_f32_to_bf16 does. */
 double rounded_bf16(double v) {
@@ -254,8 +265,14 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
     }
 
-    Param* da = nullptr;
-    if (call.grads) da = &grad_entry(call.grads, grad_name(call.prefix, "lora_A"), {sh.R, sh.K});
+    std::vector<Param*> da_by_slot(static_cast<size_t>(sh.S), nullptr);
+    const auto da_for = [&](int64_t s) -> Param* {
+        if (!call.grads) return nullptr;
+        Param*& p = da_by_slot[static_cast<size_t>(s)];
+        if (!p)
+            p = &grad_entry(call.grads, slot_grad_name(call, s, "lora_A"), {sh.R, sh.K});
+        return p;
+    };
 
     std::vector<double> g((size_t)sh.K, 0.0);
     for (int64_t m = 0; m < sh.M; ++m) {
@@ -278,12 +295,14 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
             a_cot.value[e] += g[(size_t)k] * scale;
             s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
         }
-        if (da)
+        if (call.grads)
             for (int64_t j = 0; j < sh.R; ++j) {
                 const double c = t_cot.value[(size_t)(m * sh.R + j)];
                 if (c == 0.0) continue;
+                Param* const slot_da = da_for(s);
+                if (!slot_da) break;
                 for (int64_t k = 0; k < sh.K; ++k)
-                    da->value[(size_t)(j * sh.K + k)] += (float)(c * x_at(sh, m, k));
+                    slot_da->value[(size_t)(j * sh.K + k)] += (float)(c * x_at(sh, m, k));
             }
     }
 }
@@ -366,10 +385,10 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
  *
  *   dt[m, j]   += sum_n cot y[m, n] * scale[s, n] * B[s, n, j]
  *   dB[n, j]   += sum_{m: slot[m] = s} cot y[m, n] * scale[s, n] * t[m, j]
+ *   dc y[m, n] += cot y[m, n]
  *
- * The cotangent y's base value would take is the walk's to pass on, not this op's: the record
- * writes y, and a write's slot in `dc` is not one an adjoint fills.
- */
+ * The record's y is in place: it adds to the base value the GEMM wrote. The adjoint puts y's
+ * cotangent into the write's slot, and the walk passes it on to the version y held before. */
 void lora_expand_host_adjoint(const AdjointCall& call) {
     Expand ex;
     if (!expand_layout(call.fwd.data(), call.fwd.size(), &ex)) return;
@@ -379,8 +398,18 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
-    Param* db = nullptr;
-    if (call.grads) db = &grad_entry(call.grads, grad_name(call.prefix, "lora_B"), {ex.N, ex.R});
+    AdValue& y_base_cot = call.dc->at(4);
+    if (y_base_cot.value.size() == y_cot.value.size())
+        for (size_t k = 0; k < y_cot.value.size(); ++k) y_base_cot.value[k] += y_cot.value[k];
+
+    std::vector<Param*> db_by_slot(static_cast<size_t>(ex.S), nullptr);
+    const auto db_for = [&](int64_t s) -> Param* {
+        if (!call.grads) return nullptr;
+        Param*& p = db_by_slot[static_cast<size_t>(s)];
+        if (!p)
+            p = &grad_entry(call.grads, slot_grad_name(call, s, "lora_B"), {ex.N, ex.R});
+        return p;
+    };
 
     for (int64_t m = 0; m < ex.M; ++m) {
         const int64_t s = row_slot(ex, m);
@@ -392,10 +421,13 @@ void lora_expand_host_adjoint(const AdjointCall& call) {
             const size_t b0 = (size_t)((s * ex.N + n) * ex.R);
             for (int64_t j = 0; j < ex.R; ++j)
                 t_cot.value[(size_t)(m * ex.R + j)] += cs * ex.lb->value[b0 + (size_t)j];
-            if (db)
-                for (int64_t j = 0; j < ex.R; ++j)
-                    db->value[(size_t)(n * ex.R + j)] +=
-                        (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
+            if (call.grads) {
+                Param* const slot_db = db_for(s);
+                if (slot_db)
+                    for (int64_t j = 0; j < ex.R; ++j)
+                        slot_db->value[(size_t)(n * ex.R + j)] +=
+                            (float)(cs * ex.t->value[(size_t)(m * ex.R + j)]);
+            }
         }
     }
 }

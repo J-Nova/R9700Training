@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <utility>
@@ -68,6 +69,9 @@ struct BackwardOptions {
     Side side = Side::host;          // which adjoint rows the walk asks the registry for
     ParamSet* grads = nullptr;       // added to, or null when the walk adds no gradients
     const char* prefix = "";         // the name prefix the grads entries carry (Delta::grad_prefix)
+    // Optional: the name prefix for one slot of a record that covers several sites of a fused
+    // weight (a lora record's slot operand). Empty means use `prefix` for every slot.
+    std::function<std::string(const OpRecord&, int64_t)> slot_prefix;
     // Op names whose path ends here: their adjoint never runs and no cotangent reaches their
     // reads. The record still consumes the cotangent of what it wrote.
     std::vector<std::string> stops;

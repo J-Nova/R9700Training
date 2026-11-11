@@ -117,6 +117,7 @@ void Tape::record(const RadIssueOp& issue) {
         op.row_lo = first_row(o);
         op.rows = o.rows;
         op.written = o.written != 0;
+        op.in_place = o.inout != 0;
         rec.operands.push_back(std::move(op));
         content.push_back(OperandContent{o.data, static_cast<size_t>(o.bytes), o.name != nullptr});
     }

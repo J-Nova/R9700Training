@@ -31,6 +31,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -63,6 +64,9 @@ struct AdjointCall {
     std::vector<AdValue>* dc;        // every operand, in schema order, added to, never overwritten
     ParamSet* grads;                 // the trainable leaves, or null when the walk runs without
     const char* prefix;              // the name prefix grads entries carry (Delta::grad_prefix)
+    // Optional: a site's name prefix when one record covers several sites of a fused weight. The
+    // lora rows ask it for a slot; an empty callback means every slot uses `prefix`.
+    std::function<std::string(int64_t)> slot_prefix;
 };
 
 // A twin: the forward in f64. `operands` are the op's read operands in schema order; `out` receives

@@ -4,7 +4,7 @@ diff --git a/abi/rad_runtime.h b/abi/rad_runtime.h
 index c6f5d7b..3afcced 100644
 --- a/abi/rad_runtime.h
 +++ b/abi/rad_runtime.h
-@@ -916,6 +916,60 @@ int rad_lane_join(RadCtx* c, int from, int to);
+@@ -916,6 +916,61 @@ int rad_lane_join(RadCtx* c, int from, int to);
  #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
  #define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))
  
@@ -27,6 +27,7 @@ index c6f5d7b..3afcced 100644
 +    int64_t  offset;       /* element offset into the buffer or weight, as issued */
 +    int64_t  rows;         /* dim 0 extent this issue uses; 0 means the declared extent */
 +    uint8_t  written;      /* 1 for RAD_OPD_OUT and RAD_OPD_INOUT, 0 otherwise */
++    uint8_t  inout;        /* 1 for RAD_OPD_INOUT, whose previous value the kernel also reads */
 +} RadIssueOperand;
 +
 +typedef struct RadIssueOp {
@@ -156,7 +157,7 @@ index 8d18803..f8b0ac3 100644
      return RAD_OK;
  }
  
-@@ -1321,6 +1325,64 @@ void* Ctx::buf_ptr(rad_buf b) {
+@@ -1321,6 +1325,65 @@ void* Ctx::buf_ptr(rad_buf b) {
      return buf_tmpl_[b].data;
  }
  
@@ -205,6 +206,7 @@ index 8d18803..f8b0ac3 100644
 +        const int role = (p.info && p.info->schema && i < p.info->schema->n_operands)
 +                             ? p.info->schema->operands[i].role : RAD_OPD_IN;
 +        e.written = (role == RAD_OPD_OUT || role == RAD_OPD_INOUT) ? 1 : 0;
++        e.inout = role == RAD_OPD_INOUT ? 1 : 0;
 +    }
 +    RadIssueOp ev{};
 +    ev.op         = h;

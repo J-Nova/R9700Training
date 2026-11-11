@@ -82,6 +82,9 @@ struct Plan {
     std::map<std::string, int64_t> by_name;
     std::vector<std::vector<int64_t>> write_version;               // [record][operand]
     std::vector<std::vector<std::vector<Segment>>> read_segments;  // [record][operand][segment]
+    // The versions an in-place write's previous value lived in, per row. The walk passes the
+    // write's cotangent there after the adjoint has had it.
+    std::vector<std::vector<std::vector<Segment>>> base_segments;   // [record][operand][segment]
 };
 
 // The rows one operand touches: its own range, or every row of the buffer when it gives none.
@@ -130,10 +133,12 @@ Plan make_plan(const std::vector<OpRecord>& records) {
     Plan plan;
     plan.write_version.resize(records.size());
     plan.read_segments.resize(records.size());
+    plan.base_segments.resize(records.size());
     for (size_t i = 0; i < records.size(); ++i) {
         const OpRecord& rec = records[i];
         plan.write_version[i].assign(rec.operands.size(), -1);
         plan.read_segments[i].resize(rec.operands.size());
+        plan.base_segments[i].resize(rec.operands.size());
         // Reads first: an op that writes the buffer it reads sees the version before its own.
         for (size_t j = 0; j < rec.operands.size(); ++j) {
             if (rec.operands[j].written) continue;
@@ -149,6 +154,7 @@ Plan make_plan(const std::vector<OpRecord>& records) {
             Buffer& b = plan.buffers[static_cast<size_t>(bi)];
             int64_t lo = 0, hi = 0;
             operand_rows(rec.operands[j], b, &lo, &hi);
+            if (rec.operands[j].in_place) plan.base_segments[i][j] = split_rows(b, lo, hi);
             Version v;
             v.row_lo = lo;
             v.rows = hi - lo;
@@ -396,7 +402,32 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         }
 
         const AdjointCall call{rec, fwd, cot, &dc, options.grads, options.prefix};
-        fn(call);
+        AdjointCall with_slots = call;
+        if (options.slot_prefix)
+            with_slots.slot_prefix = [&rec, &options](int64_t slot) {
+                return options.slot_prefix(rec, slot);
+            };
+        fn(with_slots);
+
+        // An in-place write's cotangent is also what the value it replaced takes. The adjoint put
+        // that in the write's slot; pass it to the versions those rows held before this write.
+        for (size_t j = 0; j < rec.operands.size(); ++j) {
+            if (!rec.operands[j].written || !rec.operands[j].in_place) continue;
+            if (plan.write_version[i][j] < 0) continue;
+            const int64_t bi = plan.by_name.at(rec.operands[j].buffer);
+            Buffer& b = plan.buffers[static_cast<size_t>(bi)];
+            if (dc[j].value.size() != static_cast<size_t>(b.rows * b.cols))
+                refuse("op '" + rec.op + "': adjoint left in-place operand '" +
+                       rec.operands[j].buffer + "' with " + std::to_string(dc[j].value.size()) +
+                       " values, not " + std::to_string(b.rows * b.cols));
+            for (const Segment& seg : plan.base_segments[i][j]) {
+                if (seg.version >= 0)
+                    add_version_full(b.versions[static_cast<size_t>(seg.version)], seg.row_lo,
+                                     seg.row_hi, dc[j].value);
+                else
+                    add_input_full(b, seg.row_lo, seg.row_hi, dc[j].value);
+            }
+        }
 
         // The writers' adjoint has run: their cotangent storage is done.
         for (size_t j = 0; j < rec.operands.size(); ++j)

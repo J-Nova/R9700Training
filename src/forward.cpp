@@ -143,6 +143,18 @@ void ForwardDriver::set_block_hook(std::function<void(const BlockView&)> hook) {
     block_hook_ = std::move(hook);
 }
 
+void ForwardDriver::set_lora(int64_t max_loras, int64_t max_rank,
+                             std::vector<std::string> targets, std::string adapter_name) {
+    lora_max_loras_ = max_loras;
+    lora_max_rank_ = max_rank;
+    lora_targets_ = std::move(targets);
+    lora_adapter_name_ = std::move(adapter_name);
+}
+
+void ForwardDriver::set_engine_hook(std::function<void(rad::Engine&)> hook) {
+    engine_hook_ = std::move(hook);
+}
+
 const ForwardStep& ForwardDriver::last() const {
     if (!last_) throw std::logic_error("r97: forward: no step has run yet");
     return *last_;
@@ -241,6 +253,10 @@ void ForwardDriver::run_engine(const Batch& batch) {
     cfg.prefill_prompts.reserve(batch.size());
     for (const TokenSeq& s : batch) cfg.prefill_prompts.push_back(s.ids);
     cfg.prefill_logits.clear();
+    cfg.lora.max_loras = lora_max_loras_;
+    cfg.lora.max_rank = lora_max_rank_;
+    cfg.lora.targets = lora_targets_;
+    cfg.prefill_lora = lora_adapter_name_;
 
     engine_.reset(new rad::Engine(std::move(cfg)));
     int s = engine_->start();
@@ -253,6 +269,7 @@ void ForwardDriver::run_engine(const Batch& batch) {
         [this](const Tape& tape, int64_t block, bool begin) { on_bracket(tape, block, begin); });
     tape_.attach(engine_->issue_ctx());
     if (!tape_.attached()) fail("the engine gave no rank context to record the step on");
+    if (engine_hook_) engine_hook_(*engine_);
 
     auto watch = std::make_unique<rad::StallWatch>("r97 forward", 60000);
     s = engine_->serve(std::move(watch));

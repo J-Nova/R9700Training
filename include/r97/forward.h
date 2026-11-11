@@ -182,10 +182,23 @@ public:
     // The step the last StepFn call ran. Throws std::logic_error before the first one.
     const ForwardStep& last() const;
 
-    // Called at every block bracket of every step. An empty hook (or none) does nothing. Only an
-    // architecture that brackets its blocks calls it: qwen35's block-quantised builds do, its bf16
-    // one does not, so on the bf16 fixture the hook is never called.
+    // Called at every block bracket of every step. An empty hook (or none) does nothing. The
+    // training patches bracket both qwen35 builds, including the bf16 one the fixture uses.
     void set_block_hook(std::function<void(const BlockView&)> hook);
+
+    // The LoRA slots the next steps' engine must offer, and the adapter name the step's
+    // sequences acquire. The join sets these from the sites Delta::to_wire yields; the driver
+    // itself never looks at a Delta.
+    void set_lora(int64_t max_loras, int64_t max_rank, std::vector<std::string> targets,
+                  std::string adapter_name = {});
+
+    // Called after the engine starts and before it serves, so a caller can load the live adapter
+    // into a slot the engine has already built. The hook runs inside step().
+    void set_engine_hook(std::function<void(rad::Engine&)> hook);
+
+    // The engine and the tape the last step ran on. Null before the first step.
+    rad::Engine* engine() { return engine_.get(); }
+    Tape& tape() { return tape_; }
 
     const ForwardConfig& config() const { return cfg_; }
 
@@ -205,6 +218,11 @@ private:
     Tape tape_;
     std::unique_ptr<ForwardStep> last_;
     std::function<void(const BlockView&)> block_hook_;
+    std::function<void(rad::Engine&)> engine_hook_;
+    int64_t lora_max_loras_ = 0;
+    int64_t lora_max_rank_ = 0;
+    std::vector<std::string> lora_targets_;
+    std::string lora_adapter_name_;
     int64_t step_tokens_ = 0;       // the token rows the step's boundaries cover
     bool residual_seen_ = false;    // a bracket found the residual at least once
     std::string residual_name_;     // the buffer every bracket must answer with
