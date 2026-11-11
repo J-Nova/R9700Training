@@ -5,8 +5,9 @@ This is the host adjoint note for the ops the gated full-attention block
 into `qk_norm_rope_gate`; the host runs `rmsnorm` on queries and keys, then `rope`, then
 `kv_store`, and finally `sigmoid` and `mul` for the gate. The qk family owns `rope`, `kv_store`,
 `sigmoid` and `mul`; the two RMS norms belong to the elementwise/norm family and are not repeated
-here. `src/adjoint/host/qk.cpp` is the f64 twin and adjoint, `tests/host/adjoint_qk.cpp` checks
-it, and this file carries every formula.
+here. `src/adjoint/host/qk.cpp` is the f64 twin and adjoint, `src/adjoint/host/qk_rows.cpp`
+registers the `rope`/`kv_store` rows the host step's backward walk uses, `tests/host/adjoint_qk.cpp`
+checks the family, and this file carries every formula.
 
 All operands are f64 and row-major in the twin, with the same layouts as radiance's host kernels.
 The adjoint takes the cotangent of the output and writes the cotangent of each differentiable

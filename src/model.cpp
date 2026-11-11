@@ -99,6 +99,14 @@ BoundaryNames BoundaryNames::from(const ForwardTape& fwd) {
     return names;
 }
 
+void BoundaryNames::add(const std::string& buffer, int64_t row_lo, int64_t row_hi) {
+    BoundaryRecord record;
+    record.id = static_cast<int64_t>(by_name_.size());
+    record.row_lo = row_lo;
+    record.row_hi = row_hi;
+    by_name_[buffer] = record;
+}
+
 bool BoundaryNames::has(const std::string& buffer) const {
     return by_name_.count(buffer) != 0;
 }

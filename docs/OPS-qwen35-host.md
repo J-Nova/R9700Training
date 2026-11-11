@@ -60,8 +60,9 @@ for bit. So the row exists and is never read: no token, no end-of-text test, no 
   the multiples of the layer count.
 - **twin / host / device** -- whether `r97train ops --registered` holds a forward twin, a host
   adjoint or a device adjoint for the op. The family issues merged so far give a twin and a host
-  adjoint to every op here except `rope`, `rope_table`, `kv_store`, `rmsnorm_quant_fp8`,
-  `gated_quant_fp8` and `quant_act_fp8`. The device column is read by a host-only run with
+  adjoint to every op here except `rope_table`, `rmsnorm_quant_fp8`, `gated_quant_fp8` and
+  `quant_act_fp8`; `rope` and `kv_store` get their rows from `src/adjoint/host/qk_rows.cpp`, the
+  stateful rows the walk needs. The device column is read by a host-only run with
   `--kernels libavx,libref`, which never loads the device plugin: `src/adjoint/device/add.hip`
   registers `add`'s device adjoint when that plugin loads, but every `device` cell below is `-`
   because this inventory does not load it. The rest is what the adjoint issues are for.
@@ -103,8 +104,8 @@ One prefill step: 65 issues, 23 op forms.
 | `add` | mlp | dtype=bf16 | 4 | yes | yes | - | - | yes | elementwise |
 | `rmsnorm` | full-attention | dtype=bf16 | 3 | yes | yes | - | - | yes | elementwise |
 | `gemm_nt` | full-attention | dtype=bf16 | 4 | yes | yes | - | - | yes | linear |
-| `rope` | full-attention | mode=mrope | 2 | - | - | - | - | yes | qk |
-| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | qk |
+| `rope` | full-attention | mode=mrope | 2 | - | yes | - | - | yes | qk |
+| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | yes | - | - | yes | qk |
 | `attn_paged` | full-attention | q_dtype=bf16 kv_dtype=bf16 | 1 | yes | yes | - | - | yes | attention |
 | `sigmoid` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `mul` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
@@ -138,8 +139,8 @@ One prefill step: 78 issues, 29 op forms.
 | `had_quant_act_i8g` | full-attention | dtype=bf16 | 4 | yes | yes | - | - | yes | quant |
 | `gemm_nt_q` | full-attention | dtype=i8a8h | 4 | yes | yes | - | - | yes | linear |
 | `rmsnorm` | full-attention | dtype=bf16 | 2 | yes | yes | - | - | yes | elementwise |
-| `rope` | full-attention | mode=mrope | 2 | - | - | - | - | yes | qk |
-| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | - | - | - | yes | qk |
+| `rope` | full-attention | mode=mrope | 2 | - | yes | - | - | yes | qk |
+| `kv_store` | full-attention | kv_dtype=bf16 | 1 | - | yes | - | - | yes | qk |
 | `attn_paged` | full-attention | q_dtype=bf16 kv_dtype=bf16 | 1 | yes | yes | - | - | yes | attention |
 | `sigmoid` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |
 | `mul` | full-attention | dtype=bf16 | 1 | yes | yes | - | - | yes | elementwise |

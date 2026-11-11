@@ -341,7 +341,11 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(rec, "eps", 1e-6);
-    const double wadd = param_num(rec, "wadd", 0.0);
+    // A live record may leave `wadd` out; the qwen35 fixture's norms all shift the gain by one,
+    // which is what the engine ran, so an absent parameter means the fixture's 1 and not zero.
+    bool has_wadd = false;
+    for (const auto& p : rec.params) has_wadd = has_wadd || p.first == "wadd";
+    const double wadd = has_wadd ? param_num(rec, "wadd", 0.0) : 1.0;
     const double mult = param_num(rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 
@@ -368,11 +372,14 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     const AdValue* w = call.fwd.size() > 1 && !call.fwd[1].value.empty() ? &call.fwd[1] : nullptr;
     const AdValue& dy = call.cot[0];
     const int64_t n = width_of(call.rec, x.shape);
-    const int64_t rows = rows_of(x, n);
+    // The write is the step's rows; a whole-buffer read can be longer than it on the engine.
+    const int64_t rows = std::min(rows_of(x, n), rows_of(dy, n));
     if (rows <= 0) return;
     if (w && (int64_t)w->value.size() < n) return;
     const double eps = param_num(call.rec, "eps", 1e-6);
-    const double wadd = param_num(call.rec, "wadd", 0.0);
+    bool has_wadd = false;
+    for (const auto& p : call.rec.params) has_wadd = has_wadd || p.first == "wadd";
+    const double wadd = has_wadd ? param_num(call.rec, "wadd", 0.0) : 1.0;
     const double mult = param_num(call.rec, "mult", 1.0);
     if (!w && wadd != 0.0) return;
 

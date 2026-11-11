@@ -37,6 +37,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -160,20 +162,29 @@ bool shrink_layout(const OpRecord& rec, const AdValue* v, size_t n, Shrink* sh) 
     const AdValue& held = v[1];  // a_scale, or the place an absent one keeps
     const AdValue& slot = v[2];
     const AdValue& la = v[3];
-    if (a.shape.size() != 2 || slot.shape.size() != 1 || la.shape.size() != 3) return false;
+    if (a.shape.size() < 2 || slot.shape.size() != 1 || la.shape.size() != 3) return false;
     /* The record's `dtype` and its operand 1 have to agree: a coded trunk passes a_scale, a float
      * trunk's position is the absent one the runtime left (radiance names it `invalid`). */
-    const bool absent = held.dtype == "invalid";
+    const bool absent = held.shape.empty() || held.value.empty();
     if (coded == absent) return false;
-    const int64_t M = a.shape[0], K = a.shape[1], S = la.shape[0], R = la.shape[1];
-    if (M <= 0 || K <= 0 || R <= 0 || S <= 0) return false;
-    if (la.shape[2] != K || slot.shape[0] != M) return false;
-    if ((int64_t)a.value.size() != M * K || (int64_t)slot.value.size() != M ||
+    /* The engine runs the op over its whole row buffer, so `a` and the written `t` are the full
+     * buffer while `slot` holds one entry per active row. The active count is the slot's length;
+     * the trailing rows of `a`, `t` and `y` belong to no token and are left alone. A synthetic
+     * tape usually makes all three the same length, which this still accepts. */
+    if (a.shape.size() < 2) return false;
+    const int64_t M = slot.shape[0];
+    int64_t a_total = 1;
+    for (int64_t d : a.shape) a_total *= d;
+    if (M <= 0 || a_total % M != 0) return false;
+    const int64_t K = a_total / M, S = la.shape[0], R = la.shape[1];
+    if (K <= 0 || R <= 0 || S <= 0) return false;
+    if (la.shape[2] != K || a.shape[0] < M) return false;
+    if ((int64_t)a.value.size() < M * K || (int64_t)slot.value.size() != M ||
         (int64_t)la.value.size() != S * R * K)
         return false;
     if (coded) {
-        if (held.shape.size() != 2 || held.shape[0] != M || held.shape[1] <= 0) return false;
-        if ((int64_t)held.value.size() != M * held.shape[1]) return false;
+        if (held.shape.size() != 2 || held.shape[0] < M || held.shape[1] <= 0) return false;
+        if ((int64_t)held.value.size() < M * held.shape[1]) return false;
     }
     sh->a = &a;
     sh->as = coded ? &held : nullptr;
@@ -252,26 +263,25 @@ void lora_shrink_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
  */
 void lora_shrink_host_adjoint(const AdjointCall& call) {
     Shrink sh;
-    if (!shrink_layout(call.rec, call.fwd.data(), call.fwd.size(), &sh)) return;
-    if (call.cot.empty()) return;
+    const bool ok = shrink_layout(call.rec, call.fwd.data(), call.fwd.size(), &sh);
     const AdValue& t_cot = call.cot[0];
-    if ((int64_t)t_cot.value.size() != sh.M * sh.R) return;
+    if ((int64_t)t_cot.value.size() < sh.M * sh.R) return;
 
+    // The activation's cotangent can be absent when the activation is frozen (a boundary the walk
+    // does not need past this op); the adapter's own gradients still read the activation's value,
+    // so they do not depend on it. Only the updates to a_cot and s_cot are guarded.
     AdValue& a_cot = call.dc->at(0);
-    if ((int64_t)a_cot.value.size() != sh.M * sh.K) return;
+    const bool have_a_cot = (int64_t)a_cot.value.size() >= sh.M * sh.K;
     AdValue* s_cot = nullptr;
-    if (sh.as) {
-        s_cot = &call.dc->at(1);
-        if ((int64_t)s_cot->value.size() != sh.M * sh.groups) return;
-    }
+    const bool have_s_cot = sh.as && (int64_t)call.dc->at(1).value.size() >= sh.M * sh.groups;
+    if (have_s_cot) s_cot = &call.dc->at(1);
 
-    std::vector<Param*> da_by_slot(static_cast<size_t>(sh.S), nullptr);
+    // Look the entry up every time: pushing a new slot's entry may reallocate the ParamSet's
+    // vector, and a pointer cached for an earlier slot would then dangle. Slot order in the
+    // engine's row buffer is not grouped, so both slots are live at once.
     const auto da_for = [&](int64_t s) -> Param* {
         if (!call.grads) return nullptr;
-        Param*& p = da_by_slot[static_cast<size_t>(s)];
-        if (!p)
-            p = &grad_entry(call.grads, slot_grad_name(call, s, "lora_A"), {sh.R, sh.K});
-        return p;
+        return &grad_entry(call.grads, slot_grad_name(call, s, "lora_A"), {sh.R, sh.K});
     };
 
     std::vector<double> g((size_t)sh.K, 0.0);
@@ -287,13 +297,13 @@ void lora_shrink_host_adjoint(const AdjointCall& call) {
         for (int64_t k = 0; k < sh.K; ++k) {
             const size_t e = (size_t)(m * sh.K + k);
             if (!sh.as) {
-                a_cot.value[e] += g[(size_t)k];
+                if (have_a_cot) a_cot.value[e] += g[(size_t)k];
                 continue;
             }
             const size_t ge = (size_t)(m * sh.groups + k / sh.group);
             const double scale = sh.as->value[ge];
-            a_cot.value[e] += g[(size_t)k] * scale;
-            s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
+            if (have_a_cot) a_cot.value[e] += g[(size_t)k] * scale;
+            if (s_cot) s_cot->value[ge] += g[(size_t)k] * sh.a->value[e];
         }
         if (call.grads)
             for (int64_t j = 0; j < sh.R; ++j) {
@@ -328,11 +338,16 @@ bool expand_layout(const AdValue* v, size_t n, Expand* ex) {
     if (t.shape.size() != 2 || slot.shape.size() != 1 || lb.shape.size() != 3 ||
         sc.shape.size() != 2)
         return false;
-    const int64_t M = t.shape[0], R = t.shape[1], S = lb.shape[0], N = lb.shape[1];
+    /* As in the shrink, `t` and the written `y` are the engine's full row buffers and `slot` is
+     * one entry per active row; only the first `slot.shape[0]` rows belong to the step. */
+    const int64_t M = slot.shape[0], R = t.shape[1], S = lb.shape[0], N = lb.shape[1];
     if (M <= 0 || N <= 0 || R <= 0 || S <= 0) return false;
-    if (lb.shape[2] != R || slot.shape[0] != M || sc.shape[0] != S || sc.shape[1] != N) return false;
-    if ((int64_t)t.value.size() != M * R || (int64_t)slot.value.size() != M ||
+    if (lb.shape[2] != R || t.shape[0] < M || sc.shape[0] != S || sc.shape[1] != N) return false;
+    if ((int64_t)t.value.size() < M * R || (int64_t)slot.value.size() != M ||
         (int64_t)lb.value.size() != S * N * R || (int64_t)sc.value.size() != S * N)
+        return false;
+    if (n == 5u && (v[4].shape.empty() || v[4].shape[0] < M ||
+                    (int64_t)v[4].value.size() < M * N))
         return false;
     ex->t = &t;
     ex->slot = &slot;
@@ -391,24 +406,24 @@ void lora_expand_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
  * cotangent into the write's slot, and the walk passes it on to the version y held before. */
 void lora_expand_host_adjoint(const AdjointCall& call) {
     Expand ex;
-    if (!expand_layout(call.fwd.data(), call.fwd.size(), &ex)) return;
+    const bool ok = expand_layout(call.fwd.data(), call.fwd.size(), &ex);
+    if (!ok) return;
     if (call.cot.empty()) return;
     const AdValue& y_cot = call.cot[0];
-    if ((int64_t)y_cot.value.size() != ex.M * ex.N) return;
+    if ((int64_t)y_cot.value.size() < ex.M * ex.N) return;
     AdValue& t_cot = call.dc->at(0);
-    if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
+    if ((int64_t)t_cot.value.size() < ex.M * ex.R) return;
 
+    /* The write is in place over the engine's full row buffer; only the active rows carry a
+     * cotangent, and only they are handed to the value the write replaced. */
     AdValue& y_base_cot = call.dc->at(4);
-    if (y_base_cot.value.size() == y_cot.value.size())
-        for (size_t k = 0; k < y_cot.value.size(); ++k) y_base_cot.value[k] += y_cot.value[k];
+    if ((int64_t)y_base_cot.value.size() >= ex.M * ex.N)
+        for (size_t k = 0; k < (size_t)(ex.M * ex.N); ++k) y_base_cot.value[k] += y_cot.value[k];
 
-    std::vector<Param*> db_by_slot(static_cast<size_t>(ex.S), nullptr);
+    // See the shrink: a cached Param* would dangle when another slot's entry is pushed.
     const auto db_for = [&](int64_t s) -> Param* {
         if (!call.grads) return nullptr;
-        Param*& p = db_by_slot[static_cast<size_t>(s)];
-        if (!p)
-            p = &grad_entry(call.grads, slot_grad_name(call, s, "lora_B"), {ex.N, ex.R});
-        return p;
+        return &grad_entry(call.grads, slot_grad_name(call, s, "lora_B"), {ex.N, ex.R});
     };
 
     for (int64_t m = 0; m < ex.M; ++m) {

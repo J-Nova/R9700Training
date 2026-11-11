@@ -78,6 +78,10 @@ public:
     // Built from what the tape holds: the boundary order is the id, the window is the rows.
     static BoundaryNames from(const ForwardTape& fwd);
 
+    // A boundary the caller knows about but the tape does not, such as a block's residual
+    // entry during a replay walk. Its id is its insertion order.
+    void add(const std::string& buffer, int64_t row_lo, int64_t row_hi);
+
     bool has(const std::string& buffer) const;
     const BoundaryRecord& at(const std::string& buffer) const;   // throws when absent
     std::vector<std::string> names() const;                      // sorted
