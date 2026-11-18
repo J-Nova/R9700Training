@@ -127,10 +127,46 @@ void kv_store_device_adjoint(const AdjointCall& call) {
     // The tape's cotangents are f64 and are added to, never overwritten.
     for (int64_t i = 0; i < n; ++i) d_k.value[(size_t)i] += (double)h_kv[(size_t)i];
     for (int64_t i = 0; i < n; ++i) d_v.value[(size_t)i] += (double)h_kv[(size_t)(n + i)];
+
+    // The in-place pool's own slot: the store overwrites the rows its slots name, so those rows of
+    // the old pool are dead -- their cotangent is the k's and v's above. Only the rows the write
+    // leaves alone carry the pool's cotangent on, and filling the slot here is what stops the
+    // walk's passthrough from copying the whole pool into it (the covered rows included). The same
+    // routing as the host row (src/adjoint/host/kv_store.cpp), by the same (block, offset)
+    // arithmetic the forward scatters with.
+    const int64_t n_blocks = pool.shape.empty() ? 0 : pool.shape[0];
+    const int64_t pool_rows = n_blocks * block_size;
+    if (pool_rows > 0) {
+        std::vector<char> covered((size_t)pool_rows, 0);
+        for (int64_t t = 0; t < tokens; ++t) {
+            const int64_t s = (int64_t)slot.value[(size_t)t];
+            if (s >= 0 && s < pool_rows) covered[(size_t)s] = 1;
+        }
+        for (size_t j = 0; j < call.rec.operands.size(); ++j) {
+            const Operand& o = call.rec.operands[j];
+            if (!o.written || !o.in_place || j >= call.dc->size()) continue;
+            AdValue& dp = call.dc->at(j);
+            if (dp.value.size() != d_pool.value.size()) continue;
+            for (int64_t row = 0; row < pool_rows; ++row) {
+                if (covered[(size_t)row]) continue;
+                const int64_t block = row / block_size;
+                const int64_t off = row % block_size;
+                for (int64_t h = 0; h < kv_heads; ++h) {
+                    const int64_t base =
+                        ((block * kv_heads + h) * block_size + off) * 2 * head_dim;
+                    for (int64_t d = 0; d < head_dim; ++d) {
+                        dp.value[(size_t)(base + d)] += d_pool.value[(size_t)(base + d)];
+                        dp.value[(size_t)(base + head_dim + d)] +=
+                            d_pool.value[(size_t)(base + head_dim + d)];
+                    }
+                }
+            }
+        }
+    }
 }
 
 }  // namespace
 
-R97_REGISTER_ADJOINT_F("kv_store", device, kv_store_device_adjoint, 2)  // slots is discrete
+R97_REGISTER_ADJOINT_FF("kv_store", device, kv_store_device_adjoint, fills_in_place_slots, 2)  // slots is discrete
 
 }  // namespace r97

@@ -47,3 +47,18 @@ R97_TEST(adjoint_registry_specific_row_beats_catch_all) {
     R97_CHECK(adjoint_find(op, Side::host, untagged, &err) == catch_all_adjoint);
     R97_CHECK(adjoint_find(op, Side::host, marked, &err) == specific_adjoint);
 }
+
+// The fills predicate a walk consults is the one of the row it calls: a specific row's predicate
+// is what a record with its parameters gets, and a row that registered none leaves the walk's
+// in-place passthrough on.
+R97_TEST(adjoint_registry_fills_follow_the_served_row) {
+    const char* op = "registry_fills_probe";
+    adjoint_register(op, Side::host, catch_all_adjoint, {}, nullptr);
+    adjoint_register(op, Side::host, specific_adjoint, {}, tagged, fills_in_place_slots);
+
+    const std::vector<OpParam> untagged = {{"M", int64_t{4}}};
+    const std::vector<OpParam> marked = {{"M", int64_t{4}}, {"registry_probe_tag", int64_t{1}}};
+    R97_CHECK(adjoint_fills(op, Side::host, untagged) == nullptr);
+    R97_CHECK(adjoint_fills(op, Side::host, marked) == fills_in_place_slots);
+    R97_CHECK(adjoint_fills(op, Side::device, marked) == nullptr);  // no device row
+}

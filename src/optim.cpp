@@ -161,9 +161,14 @@ float clip_impl(ParamSet& grads, float max_norm, int nthreads) {
     });
     double sq = 0.0;
     for (size_t c = 0; c < nchunks; ++c) sq += parts[c];
-    const float norm = float(std::sqrt(sq));
-    if (max_norm > 0.0f && norm > max_norm && norm > 0.0f) {
-        const float s = max_norm / norm;
+    // The norm is compared and the scale computed in double: a gradient whose norm passes f32's
+    // 3.4e38 (the device walk's is ~7.5e38 at the 512-token step) would otherwise convert to Inf,
+    // make the scale 1/Inf = 0, and zero the whole gradient instead of clipping it. The scale
+    // itself is a representable f32 subnormal (1/7.5e38 = 1.3e-39).
+    const double norm_d = std::sqrt(sq);
+    const float norm = float(norm_d);
+    if (max_norm > 0.0f && norm_d > double(max_norm) && norm_d > 0.0) {
+        const float s = float(double(max_norm) / norm_d);
         parallel_split(nchunks, nthreads, [&](size_t c0, size_t c1) {
             for (size_t c = c0; c < c1; ++c) {
                 const size_t lo = c * kChunk;

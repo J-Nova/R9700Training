@@ -54,7 +54,7 @@ extern "C" const RadKernelInfo* rad_kernel_at(int) { return nullptr; }
 // plugin serves no rows to a process that is not r97. Add no fallback until a kernel uses one.
 namespace r97 {
 
-void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, ParamPred) {}
+void adjoint_register(const char*, Side, AdjointFn, const std::vector<int>&, ParamPred, FillsFn) {}
 
 // The head's chunk kernel is not an op's adjoint: the loss registers it (include/r97/head.h) so the
 // walk in src/head.cpp can run a chunk on the card.

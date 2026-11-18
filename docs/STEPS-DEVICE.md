@@ -168,11 +168,20 @@ Both cases assert the contract issue #146 asks: the `StepFn` runs, the returned 
 the params' names and shapes, the forward is finite, and the optimiser applied one update. The
 checks on the gradient's values — `all_finite`, the zero / non-zero split, the descent — are
 printed always and asserted when the walk's gradient is finite, so they re-arm the moment it
-becomes one. On the live container the walk's cotangents are non-finite by the rows' own
-mathematics (#145's verdict,
-[`reports/2026-11-15-device-backward-cotangent-growth.md`](reports/2026-11-15-device-backward-cotangent-growth.md)),
-and the work that makes them finite is #142's and #149's (PR #157's in-place mark);
-`R97_DSTEP_ASSERT_FINITE=1` forces the value checks while it is not.
+becomes one. On the current tree the **512-token** walk's cotangent is finite: #157's in-place
+restore serves the 63 reads with no earlier writer from the block's stored boundary, and a
+record handed a cotangent past f32's range falls back to its host row (the same arithmetic in
+f64; see [`reports/2026-11-18-device-backward-55.md`](reports/2026-11-18-device-backward-55.md)).
+The **4096-token** case is still non-finite, at `gemm_nt_q`'s `gdn_o.q8`: that weight is
+plugin-private, the host row refuses it by name, so the fallback cannot serve the record and the
+device row's f32 output overflows. The walk's norm is ~1e38, but the same-tree FD measures the
+true leaf gradients at O(1)..O(150) mean-loss (block 63: 1.86, block 0: −145.5) against the
+walk's 0.0074 and −6.7e35 — the last layer 250x too small, the bottom 4.6e33x too large — so the
+norm is the walk's per-block amplification (#145), not the checkpoint's. The descent is therefore
+held only as a **direction** check — the unclipped 1e-4/3e-4 probes or a clipped step — while the
+config's 1e-3 is printed and reported, not asserted. The magnitude is still wrong and #55 stays
+open.
+`R97_DSTEP_ASSERT_FINITE=1` forces the value checks.
 
 The 512-token case's row coverage is a separate check, because a device row is an optimisation
 and the walk falls back to the host row where `libr97` has none (`allow_host_fallback` in

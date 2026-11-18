@@ -163,6 +163,16 @@ void test_clipping() {
     r97::clip_global_norm(g2, 100.0f);                       // norm below the cap: untouched
     R97_CHECK(std::abs(g2[0].value[0] - 1.5f) < 1e-5);
 
+    // A norm past f32's 3.4e38: two leaves of 3e38 give a norm of 4.24e38. The compare and the
+    // scale are double, so the gradient is rescaled to unit norm; a float norm would be Inf and
+    // the scale 1/Inf = 0, zeroing the whole gradient. The returned norm still converts to Inf.
+    ParamSet big;
+    big.push_back(make("g", {2}, {3e38f, 3e38f}));
+    const float big_norm = r97::clip_global_norm(big, 1.0f);
+    R97_CHECK(std::isinf(big_norm));
+    R97_CHECK(std::abs(big[0].value[0] - 0.70710678f) < 1e-3f);
+    R97_CHECK(std::abs(big[0].value[1] - 0.70710678f) < 1e-3f);
+
     // Through the optimiser: clipping rescales the gradient before m and v see it, so the
     // hand computation must run on the rescaled gradient.
     const double G[2][4] = {{3.0, 0.0, -4.0, 0.0}, {6.0, 8.0, 0.0, 0.0}};  // norms 5 and 10

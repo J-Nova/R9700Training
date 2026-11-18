@@ -534,7 +534,7 @@ R97_REGISTER_TWIN("lora_expand_mm", lora_expand_twin)
 R97_REGISTER_ADJOINT_IF_F("lora_shrink", host, lora_shrink_host_adjoint, coded_act, 2, 3)
 R97_REGISTER_ADJOINT_F("lora_shrink", host, lora_shrink_host_adjoint, 1, 2, 3)
 
-R97_REGISTER_ADJOINT_F("lora_expand", host, lora_expand_host_adjoint, 1, 2, 3)
+R97_REGISTER_ADJOINT_FF("lora_expand", host, lora_expand_host_adjoint, fills_in_place_slots, 1, 2, 3)
 R97_REGISTER_ADJOINT_F("lora_expand_mm", host, lora_expand_host_adjoint, 1, 2, 3)
 
 }  // namespace r97

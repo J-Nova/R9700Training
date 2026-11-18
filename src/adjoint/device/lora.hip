@@ -518,6 +518,20 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
     AdValue& t_cot = call.dc->at(0);
     if ((int64_t)t_cot.value.size() != ex.M * ex.R) return;
 
+    // The direct path of an in-place write, as the host row fills it (src/adjoint/host/lora.cpp):
+    // the buffer the write replaces reads its own cotangent back, unchanged. The walk's passthrough
+    // fills an empty slot with the same value, so this changes nothing in a walk -- it makes the
+    // row say the same thing when a check calls it without one, which is how the aliased records
+    // are held to a finite difference.
+    for (size_t i = 0; i < call.rec.operands.size(); ++i) {
+        const Operand& o = call.rec.operands[i];
+        if (!o.written || !o.in_place) continue;
+        if (i >= call.dc->size()) continue;
+        AdValue& d_base = call.dc->at(i);
+        if (d_base.value.size() == y_cot.value.size())
+            for (size_t e = 0; e < y_cot.value.size(); ++e) d_base.value[e] += y_cot.value[e];
+    }
+
     RadStream stream = adjoint_stream();
     if (!stream) return;
 
@@ -576,6 +590,6 @@ void lora_expand_device_adjoint(const AdjointCall& call) {
 // float activation's shrink is the host row's. `slot` and `lora_a` are frozen, as on the host.
 R97_REGISTER_ADJOINT_IF_F("lora_shrink", device, lora_shrink_device_adjoint, coded_act, 2, 3)
 // The slot, the pool's B and the per-row scale are frozen, as on the host.
-R97_REGISTER_ADJOINT_F("lora_expand", device, lora_expand_device_adjoint, 1, 2, 3)
+R97_REGISTER_ADJOINT_FF("lora_expand", device, lora_expand_device_adjoint, fills_in_place_slots, 1, 2, 3)
 
 }  // namespace r97

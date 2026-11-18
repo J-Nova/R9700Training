@@ -547,6 +547,25 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             cot_non_finite[k] = first_non_finite(c.value);
         });
 
+        // The largest finite magnitude the row is handed, over every written operand's
+        // cotangent. The device rows take their operands in f32 and write the cotangent back
+        // through the record's dtype; the cotangent is the one value they cannot widen.
+        double cot_max = 0.0;
+        for (const AdValue& c : cot)
+            for (double q : c.value) {
+                const double a = std::fabs(q);
+                if (std::isfinite(a) && a > cot_max) cot_max = a;
+            }
+        // A host row cannot read a weight the tape carries behind `raw` (the engine's private
+        // encoding): it refuses by name, and the device row is the only side that decodes it. So
+        // the range fallback below asks only for records whose forward the host row can read.
+        bool host_readable = true;
+        for (const AdValue& v : fwd)
+            if (v.raw != nullptr) {
+                host_readable = false;
+                break;
+            }
+
         // The adjoint sees the record the caller prepared when it wants one: the join may hand it
         // names and rows that differ from the tape's, while the walk keeps the tape's record for
         // its versions, boundaries and snapshots. The row is resolved from the prepared record's
@@ -568,6 +587,24 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // f64, and the caller asked for the fallback. `err` keeps the requested side's
             // message, so a missing row on both sides still refuses with the one that was asked
             // for.
+            std::string host_err;
+            AdjointFn host_fn = adjoint_find(adjoint_rec->op, Side::host, adjoint_rec->params,
+                                             &host_err);
+            if (host_fn) {
+                fn = host_fn;
+                served = Side::host;
+            }
+        }
+        // A device row computes in f32 (its kernels' operands) and writes the cotangent back
+        // through the record's dtype, which the tape holds at 16 bits. A cotangent it is handed
+        // outside that range is not representable there: the row's arithmetic overflows and every
+        // row below it inherits the Inf. The host row is the same arithmetic in f64, so a record
+        // whose incoming cotangent is past the card's range falls back to it. The limit leaves
+        // headroom for the row's own amplification -- the gated norm's `sc^3` term, the quant
+        // row's division by the group's scale -- not just f32's 3.4e38.
+        constexpr double kDeviceCotMax = 1e30;
+        if (fn && served == Side::device && options.allow_host_fallback && host_readable &&
+            cot_max > kDeviceCotMax) {
             std::string host_err;
             AdjointFn host_fn = adjoint_find(adjoint_rec->op, Side::host, adjoint_rec->params,
                                              &host_err);
@@ -643,6 +680,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
         // the call -- resolved before the slots are sized: the walk does not ask a row for its
         // frozen operands, and a row that served must not write them anyway.
         const std::vector<int> frozen = adjoint_frozen(adjoint_rec->op, served, adjoint_rec->params);
+        const FillsFn fills = adjoint_fills(adjoint_rec->op, served, adjoint_rec->params);
         const std::set<size_t> frozen_at(frozen.begin(), frozen.end());
 
         // dc: one slot per operand, in schema order. A slot the row may add to -- a read, or an
@@ -742,6 +780,11 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
             // replaced carries the write's cotangent unchanged (an expand adds its branch to y
             // without touching the read's slot; a mul, a rope or a state update fill theirs).
             //
+            // A row that registered a fills predicate owns the slot: a zero there is the row's
+            // answer (kv_store's uncovered pool rows are unread in a single-pass store, so the
+            // row's correct fill is all zero), and passing the cotangent through would add the
+            // covered rows' cotangent a second time.
+            //
             // The direct path is only the answer when no *separate* read of the same buffer
             // already answered it. A record with `read x, write x` gives the row the read's slot to
             // fill, and that slot distributes to the same prior version this write's segments name
@@ -762,6 +805,7 @@ BackwardResult backward_block(const std::vector<OpRecord>& records,
                 // A slot the walk did not size is not the row's to fill: it is frozen, and the
                 // sum below would read it as "untouched" and copy the read's cotangent in.
                 if (!sized[j]) continue;
+                if (fills && fills(call.rec, j)) continue;
                 double written = 0.0;
                 for (double v : dc[j].value) written += std::fabs(v);
                 if (written == 0.0 && !read_answered(j))

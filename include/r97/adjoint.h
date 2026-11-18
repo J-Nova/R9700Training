@@ -150,12 +150,24 @@ using TwinFn = void (*)(const OpRecord& rec, const std::vector<AdValue>& operand
 using AdjointFn = void (*)(const AdjointCall& call);
 // A predicate on the op's parameters, for example the dtype; null accepts every record.
 using ParamPred = bool (*)(const std::vector<OpParam>& params);
+// Whether the adjoint row fills one operand's dc slot itself, for the records the walk marks in
+// place. A row that answers an in-place write -- the value it replaced carries the write's
+// cotangent -- registers one: the walk then knows a zero slot is the row's answer, not an empty
+// slot to pass the cotangent through. Null (the default) is a row that leaves the slot to the
+// passthrough.
+using FillsFn = bool (*)(const OpRecord& rec, size_t operand);
+
+// The fills predicate a row registers when it fills every slot the record marks in place: the
+// direct path, where the value a write replaced carries the write's cotangent.
+inline bool fills_in_place_slots(const OpRecord& rec, size_t operand) {
+    return operand < rec.operands.size() && rec.operands[operand].in_place;
+}
 
 // -- registry ----------------------------------------------------------------
 
 void twin_register(const char* op, TwinFn fn, ParamPred pred);
 void adjoint_register(const char* op, Side side, AdjointFn fn, const std::vector<int>& frozen,
-                      ParamPred pred);
+                      ParamPred pred, FillsFn fills = nullptr);
 
 // Lookup applies the first row of that side whose predicate accepts the parameters. Rows for one
 // op are tried in registration order, which across translation units the link order decides, so
@@ -167,6 +179,10 @@ AdjointFn adjoint_find(const std::string& op, Side side, const std::vector<OpPar
 
 // The frozen operand positions of the adjoint row that serves the op; empty when nothing does.
 std::vector<int> adjoint_frozen(const std::string& op, Side side, const std::vector<OpParam>& params);
+
+// The fills predicate of the adjoint row that serves the op; null when nothing does or the row
+// leaves its in-place slots to the walk's passthrough.
+FillsFn adjoint_fills(const std::string& op, Side side, const std::vector<OpParam>& params);
 
 // Every op with at least one row, sorted.
 std::vector<std::string> ops_registered();
@@ -196,11 +212,12 @@ struct AdjointRow {
     AdjointFn fn;
     std::vector<int> frozen;
     ParamPred pred;
+    FillsFn fills = nullptr;
 };
 struct Registrar {
     explicit Registrar(const TwinRow& r) { twin_register(r.op, r.fn, r.pred); }
     explicit Registrar(const AdjointRow& r) {
-        adjoint_register(r.op, r.side, r.fn, r.frozen, r.pred);
+        adjoint_register(r.op, r.side, r.fn, r.frozen, r.pred, r.fills);
     }
 };
 
@@ -232,6 +249,12 @@ struct Registrar {
 #define R97_REGISTER_ADJOINT_IF_F(op, side, fn, pred, ...) \
     static ::r97::Registrar R97_REG_NAME(r97_reg_adj_, __LINE__) { \
         ::r97::AdjointRow{op, ::r97::Side::side, fn, {__VA_ARGS__}, pred} \
+    };
+// A row that fills the in-place slots its `fills` predicate names. The walk then treats a zero
+// slot as the row's answer instead of passing the incoming cotangent through it.
+#define R97_REGISTER_ADJOINT_FF(op, side, fn, fills, ...) \
+    static ::r97::Registrar R97_REG_NAME(r97_reg_adj_, __LINE__) { \
+        ::r97::AdjointRow{op, ::r97::Side::side, fn, {__VA_ARGS__}, nullptr, fills} \
     };
 
 }  // namespace r97

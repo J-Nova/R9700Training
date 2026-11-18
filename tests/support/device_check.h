@@ -202,10 +202,31 @@ inline AdjointCall make_call(const Case& c, std::vector<AdValue>* fwd, std::vect
     TwinFn twin = twin_find(c.rec.op, c.rec.params, nullptr);
     if (!twin) throw std::runtime_error("no twin for op '" + c.rec.op + "'");
 
-    *fwd = c.in;
     std::vector<AdValue> out;
     twin(c.rec, c.in, &out);
-    fwd->insert(fwd->end(), out.begin(), out.end());
+
+    // The forward in schema order: a read takes the caller's next read operand, a write the twin's
+    // next output. An in-place write is both -- the caller carries the pre-op value as an extra
+    // last read (the host rows' convention), the twin consumes it, and the schema position the
+    // adjoint reads holds the post-op value the twin produced. Appending every output after every
+    // read, as this did, is the same order only when the record's writes all follow its reads; an
+    // aliased slot puts a write before later reads, and the row then differentiated at the wrong
+    // operand.
+    fwd->clear();
+    size_t read_at = 0, write_at = 0;
+    for (const Operand& op : c.rec.operands) {
+        if (op.written) {
+            if (write_at >= out.size())
+                throw std::runtime_error("device_check: op '" + c.rec.op + "' write '" +
+                                         op.buffer + "' has no twin output");
+            fwd->push_back(out[write_at++]);
+        } else {
+            if (read_at >= c.in.size())
+                throw std::runtime_error("device_check: op '" + c.rec.op + "' read '" +
+                                         op.buffer + "' has no value");
+            fwd->push_back(c.in[read_at++]);
+        }
+    }
 
     dc->clear();
     for (const Operand& op : c.rec.operands) {

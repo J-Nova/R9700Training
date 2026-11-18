@@ -20,6 +20,7 @@ struct AdjointEntry {
     AdjointFn fn;
     std::vector<int> frozen;
     ParamPred pred;
+    FillsFn fills;
 };
 
 struct Table {
@@ -92,8 +93,8 @@ void twin_register(const char* op, TwinFn fn, ParamPred pred) {
 }
 
 void adjoint_register(const char* op, Side side, AdjointFn fn, const std::vector<int>& frozen,
-                      ParamPred pred) {
-    Table::get().adjoints.emplace(op, AdjointEntry{side, fn, frozen, pred});
+                      ParamPred pred, FillsFn fills) {
+    Table::get().adjoints.emplace(op, AdjointEntry{side, fn, frozen, pred, fills});
 }
 
 TwinFn twin_find(const std::string& op, const std::vector<OpParam>& params, std::string* error) {
@@ -116,6 +117,11 @@ std::vector<int> adjoint_frozen(const std::string& op, Side side,
                                 const std::vector<OpParam>& params) {
     if (const AdjointEntry* r = adjoint_match(op, side, params)) return r->frozen;
     return {};
+}
+
+FillsFn adjoint_fills(const std::string& op, Side side, const std::vector<OpParam>& params) {
+    if (const AdjointEntry* r = adjoint_match(op, side, params)) return r->fills;
+    return nullptr;
 }
 
 std::vector<std::string> ops_registered() {
