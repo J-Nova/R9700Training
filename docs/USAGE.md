@@ -133,6 +133,21 @@ usage: r97train deltas
 Takes no flags. Prints one line per registered trainable kind, sorted; `docs/OBJECTIVES.md` and the
 `include/r97/delta.h` contract say what a new one is and where it registers.
 
+### `dump-weight`
+
+```text
+usage: r97train dump-weight <file.rad> <name> [<name>...]
+```
+
+Reads the container as a file — no engine, no kernel library, no card — and prints each named
+weight's rank, shape, encoding and planes and, for a one-element-a-value plane, its first eight
+values with the whole tensor's L1 and sum. A name that misses lists the directory entries containing
+it, so a spelling the tape uses and the container does not is found rather than read as an absent
+weight; a code plane is shown as its raw codes, never as values, so a quantised weight cannot be
+mistaken for a plain one. Several names may be given at once, which is how a walk operand is held to
+the container's own tensor — the check that settled whether the fused norm's gain was the weight the
+container holds.
+
 ### `grad`
 
 ```text

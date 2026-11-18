@@ -451,6 +451,20 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, in
     return nullptr;
 }
 
+// The fused norm's residual (docs/OPS.md's `residual`:inout?): operand 1, written and in place,
+// of operand 0's logical shape. On the live tape the tape snapshots the operand after the op, so
+// its value is the post-update sum x + residual_old, and the reference reads that value back as
+// the norm's input (libref/ref_quant.cpp's `src(i)` narrows the sum to the residual's dtype).
+// -1 when the record declares no residual: the plain `rmsnorm` record (x, w, y) never does, and
+// that path stays byte-identical.
+int64_t rmsnorm_residual(const OpRecord& rec) {
+    if (rec.operands.size() <= 1) return -1;
+    const Operand& o = rec.operands[1];
+    if (!o.written || !o.in_place) return -1;
+    if (o.shape != rec.operands[0].shape) return -1;
+    return 1;
+}
+
 /* y[r, i] = x[r, i] * rsqrt(mean(x[r]^2) + eps) * (w[i] + wadd) * mult, the gain formed in f64
  * (the kernel forms it in f32, before the store's rounding). `wadd` without a gain is refused by
  * the kernel and left to nothing here. A gain the record names but the tape could not give values
@@ -458,7 +472,25 @@ const AdValue* norm_gain(const OpRecord& rec, const std::vector<AdValue>& op, in
  * than a refusal. */
 void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vector<AdValue>* out) {
     if (op.empty()) return;
-    const AdValue& x = op[0];
+    const int64_t res_at = rmsnorm_residual(rec);
+    // The norm's input is operand 1's snapshot when the record declares a residual: the tape
+    // snapshots it after the op, so it already holds the sum x + residual_old. Refuse rather than
+    // sum the operands: the reference reads the snapshot back, and adding them here would build a
+    // value the kernel never wrote.
+    if (res_at >= 0) {
+        if (op.size() <= (size_t)res_at)
+            throw std::invalid_argument("r97: rmsnorm twin: op '" + rec.op + "' at " +
+                                        std::to_string(rec.position) +
+                                        " declares a residual the walk gave no value for");
+        if (op[(size_t)res_at].value.size() != op[0].value.size())
+            throw std::invalid_argument("r97: rmsnorm twin: op '" + rec.op + "' at " +
+                                        std::to_string(rec.position) +
+                                        ": the residual operand 1 has " +
+                                        std::to_string(op[(size_t)res_at].value.size()) +
+                                        " values, not the input's " +
+                                        std::to_string(op[0].value.size()));
+    }
+    const AdValue& x = res_at >= 0 ? op[(size_t)res_at] : op[0];
     const int64_t n = width_of(rec, x.shape);
     const AdValue* w = norm_gain(rec, op, n, "twin");
     const int64_t rows = rows_of(x, n);
@@ -542,8 +574,29 @@ void rmsnorm_twin(const OpRecord& rec, const std::vector<AdValue>& op, std::vect
  * existed. */
 void rmsnorm_host_adjoint(const AdjointCall& call) {
     if (call.cot.empty() || call.fwd.empty() || call.dc->empty()) return;
-    const AdValue& x = call.fwd[0];
-    const AdValue& dy = call.cot[0];
+    const int64_t res_at = rmsnorm_residual(call.rec);
+    // The norm's input is operand 1's snapshot when the record declares a residual (the tape
+    // snapshots it after the op, so it holds the sum x + residual_old). The row reads the snapshot,
+    // never a sum of its own, as the reference does (libref's `src(i)`).
+    if (res_at >= 0) {
+        if (call.fwd.size() <= (size_t)res_at)
+            throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) +
+                                     " declares a residual the walk gave no value for");
+        if (call.fwd[(size_t)res_at].value.size() != call.fwd[0].value.size())
+            throw std::runtime_error("r97: rmsnorm adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) +
+                                     ": the residual operand 1 has " +
+                                     std::to_string(call.fwd[(size_t)res_at].value.size()) +
+                                     " values, not the input's " +
+                                     std::to_string(call.fwd[0].value.size()));
+    }
+    const AdValue& x = res_at >= 0 ? call.fwd[(size_t)res_at] : call.fwd[0];
+    // The intermediate's cotangent is the part's last write; the residual's incoming cotangent
+    // (when declared) is the write before it -- the part record's writes are the residual in
+    // place, then the elementwise output the quantiser rotates.
+    const AdValue& dy = call.cot.back();
+    const AdValue* cot_res = (res_at >= 0 && call.cot.size() >= 2) ? &call.cot.front() : nullptr;
     const int64_t n = width_of(call.rec, x.shape);
     const AdValue* w = norm_gain(call.rec, call.fwd, n, "adjoint");
     // R97_GAIN_POS=1: which snapshot the *adjoint* took. `GAINPOS` shows two at the same position --
@@ -594,6 +647,7 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
     }
 
     AdValue& dx = call.dc->at(0);
+    AdValue* dx_res = res_at >= 0 ? &call.dc->at((size_t)res_at) : nullptr;
     std::vector<char> readable((size_t)rows, 0);
     int64_t zeroed = 0, admitted = 0, refused = 0;
     for (int64_t r = 0; r < rows; ++r) {
@@ -631,9 +685,84 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
         for (int64_t i = 0; i < n; ++i) {
             const double c = w ? w->value[(size_t)i] + wadd : 1.0;
             const double shared = s * s * s * x.value[(size_t)(b + i)] * t / (double)n;
-            dx.value[(size_t)(b + i)] += mult * (s * c * dy.value[(size_t)(b + i)] - shared);
+            // v = x + residual_old's cotangent, carried in full by BOTH summands (the `add` rule,
+            // docs/reports/2026-11-15-device-backward-cotangent-growth.md): the norm's input term
+            // `dv` plus the residual write's own incoming cotangent. With `dv = 0` the row reduces
+            // to `add`, both slots getting the residual's cotangent once.
+            const double d = mult * (s * c * dy.value[(size_t)(b + i)] - shared) +
+                             (cot_res ? cot_res->value[(size_t)(b + i)] : 0.0);
+            dx.value[(size_t)(b + i)] += d;
+            if (dx_res) dx_res->value[(size_t)(b + i)] += d;
         }
     });
+    // R97_GAIN_POS=1: the per-row scale both ways for a fused norm that has a residual. The row's
+    // input cotangent is `s = 1/rms(input)` to first order, so a wrong input scales every per-norm
+    // cotangent by the rms ratio between the branch (operand 0) and the residual (operand 1), and
+    // two norms per block square it. Printing both ranges makes that ratio the test: if the
+    // cotangent table moved by the predicted factor the input was the defect; if it did not, the
+    // ratio says the growth lives elsewhere. Print only, over the rows the row visits.
+    if (std::getenv("R97_GAIN_POS") != nullptr && res_at >= 0) {
+        double s0_min = 0.0, s0_max = 0.0, s1_min = 0.0, s1_max = 0.0;
+        for (int64_t r = 0; r < rows; ++r) {
+            if (!readable[(size_t)r]) continue;
+            const int64_t b = r * n;
+            double ss0 = 0.0, ss1 = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                ss0 += call.fwd[0].value[(size_t)(b + i)] * call.fwd[0].value[(size_t)(b + i)];
+                ss1 += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+            }
+            const double s0 = 1.0 / std::sqrt(ss0 / (double)n + eps);
+            const double s1 = 1.0 / std::sqrt(ss1 / (double)n + eps);
+            if (s0_min == 0.0 || s0 < s0_min) s0_min = s0;
+            if (s0 > s0_max) s0_max = s0;
+            if (s1_min == 0.0 || s1 < s1_min) s1_min = s1;
+            if (s1 > s1_max) s1_max = s1;
+        }
+        std::fprintf(stderr, "NORMSCALE pos=%lld op=%s s_in0=[%.6g,%.6g] s_in1=[%.6g,%.6g]\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), s0_min, s0_max, s1_min,
+                     s1_max);
+        std::fflush(stderr);
+    }
+
+    // R97_GAIN_POS=1: the positive control the fused record cannot give. At a plain `rmsnorm`
+    // there is no quantiser and no rotation, so the row's own formula `y_i = x_i*s*(w+wadd)*mult`
+    // can be compared against the value the kernel wrote (`call.fwd.back()`, the in-place write's
+    // own tensor). A match says the norm formula and the gain handling are right, and so that the
+    // fused record's 100% disagreement is its input or its fused stage; a miss says the norm
+    // formula itself is the defect -- no earlier diagnosis compared the twin against an exactly
+    // known, unquantised write.
+    if (std::getenv("R97_GAIN_POS") != nullptr && call.rec.op == "rmsnorm" && !call.fwd.empty()) {
+        const AdValue& wr = call.fwd.back();
+        if (wr.value.size() == x.value.size()) {
+            double worst = 0.0, wscale = 0.0;
+            int64_t wr_r = -1, wr_i = -1;
+            for (int64_t r = 0; r < rows; ++r) {
+                const int64_t b = r * n;
+                double ss = 0.0;
+                for (int64_t i = 0; i < n; ++i) ss += x.value[(size_t)(b + i)] * x.value[(size_t)(b + i)];
+                const double s = 1.0 / std::sqrt(ss / (double)n + eps);
+                for (int64_t i = 0; i < n; ++i) {
+                    const double c = w ? w->value[(size_t)i] + wadd : 1.0;
+                    const double yv = x.value[(size_t)(b + i)] * s * c * mult;
+                    const double d = std::fabs(yv - wr.value[(size_t)(b + i)]);
+                    if (std::fabs(wr.value[(size_t)(b + i)]) > wscale)
+                        wscale = std::fabs(wr.value[(size_t)(b + i)]);
+                    if (d > worst) {
+                        worst = d;
+                        wr_r = r;
+                        wr_i = i;
+                    }
+                }
+            }
+            std::fprintf(stderr,
+                         "NORMELEM pos=%lld op=%s rows=%lld n=%lld gain=%s worst=%.6g wmax=%.6g "
+                         "rel=%.6g at r=%lld i=%lld\n",
+                         (long long)call.rec.position, call.rec.op.c_str(), (long long)rows,
+                         (long long)n, w != nullptr ? "yes" : "none", worst, wscale,
+                         wscale > 0.0 ? worst / wscale : worst, (long long)wr_r, (long long)wr_i);
+            std::fflush(stderr);
+        }
+    }
 
     // R97_DUMP_QUANT=1: the two numbers that decide what this row's Jacobian is -- `s` is the
     // per-row 1/rms of the activation and `gain` the largest `|w + wadd|` -- beside the sums it was

@@ -852,6 +852,18 @@ std::string shape_text(const std::vector<int64_t>& shape) {
     return s + "]";
 }
 
+// The fused norm's residual, by role: operand 1, written and in place, of operand 0's logical
+// shape (the device slice's test, src/adjoint/device/quant.hip:704-716); -1 when absent. On the
+// live tape its snapshot is the post-update sum x + residual_old, which the elementwise part
+// reads as its norm's input and whose incoming cotangent both summands carry.
+int64_t rmsnorm_residual(const OpRecord& rec) {
+    if (rec.operands.size() <= 1) return -1;
+    const Operand& o = rec.operands[1];
+    if (!o.written || !o.in_place) return -1;
+    if (o.shape != rec.operands[0].shape) return -1;
+    return 1;
+}
+
 // The quantiser's own record over the part's output: the fused producer's intermediate is the
 // quantiser's activation, so the part is served by the family's existing twin and adjoint under
 // had_quant_act_i8g. Under `<op>_ste` the quantiser's own linearised row is used instead, and its
@@ -964,6 +976,13 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
         else if (scale_at < 0 && o.dtype == "f32" && o.shape.size() == 2)
             scale_at = (int64_t)j;
     }
+    // The residual's slot carries the sum the tape snapshots (its own operand), not the part's
+    // output: the kernel writes x + residual_old back, and the tape's snapshot is exactly that.
+    const int64_t residual_at = (part == Part::rmsnorm) ? rmsnorm_residual(rec) : -1;
+    size_t residual_read = 0;
+    if (residual_at >= 0)
+        for (size_t k = 0; k < (size_t)residual_at; ++k)
+            if (!rec.operands[k].written || rec.operands[k].in_place) ++residual_read;
     for (size_t j = 0; j < rec.operands.size(); ++j) {
         const Operand& o = rec.operands[j];
         if (!o.written) continue;
@@ -976,8 +995,11 @@ void fused_twin(const OpRecord& rec, const std::vector<AdValue>& operands,
         if (!o.dtype.empty()) slot.dtype = o.dtype;
         int64_t n_slot = 1;
         for (int64_t d : o.shape) n_slot *= d;
-        if (o.in_place || n_slot == (int64_t)y[0].value.size())
-            slot.value = y[0].value;
+        if (o.in_place || n_slot == (int64_t)y[0].value.size()) {
+            // The residual's post-op value is the sum the tape snapshots (its own operand), not the
+            // part's output; the other in-place and part-width writes carry the part's output.
+            slot.value = (j == (size_t)residual_at) ? operands[residual_read].value : y[0].value;
+        }
         else {
             // The direct path: the write over a buffer the record also reads carries the read's
             // value, and the backward differentiates it at the identity.
@@ -1318,6 +1340,138 @@ void fused_adjoint(const AdjointCall& call, Part part) {
                              sum_d > 0.0 ? sum_y / sum_d : 0.0,
                              y2_scale > 0.0 ? sort_rel / y2_scale : sort_rel,
                              y2_scale > 0.0 ? y2_rel / y2_scale : y2_rel);
+                // R97_GAIN_POS=1: the elements, not the maxima and not the first four. `deq_rel`
+                // is a maximum over all 2621440 elements, so indices 0..3 can be the well-behaved
+                // ones and a consistent reading there would be uninformative; the elements worth
+                // printing are the four with the largest |y - dq|, which is where the disagreement
+                // lives. `deq_vs_write` establishes that `dq` IS the kernel's own activation, so a
+                // `dq/n` that is near-constant across elements means the scale term diverges, a
+                // scattered one means the gain or the vector does.
+                if (std::getenv("R97_GAIN_POS") != nullptr) {
+                    struct Hit {
+                        double d = -1.0;
+                        int64_t r = -1, i = -1;
+                    } top[4];
+                    double dqmax_seen = 0.0;
+                    // The per-row scale, once: the row-alignment search below needs it for every
+                    // candidate row.
+                    std::vector<double> srow((size_t)rows, 0.0);
+                    for (int64_t r = 0; r < rows; ++r) {
+                        double ss = 0.0;
+                        for (int64_t j = 0; j < n; ++j) {
+                            const double v = call.fwd[0].value[(size_t)(r * n + j)];
+                            ss += v * v;
+                        }
+                        srow[(size_t)r] = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                    }
+                    for (int64_t r = 0; r < rows; ++r) {
+                        for (int64_t i = 0; i < n; ++i) {
+                            const double a = y[0].value[(size_t)(r * n + i)];
+                            const double b = dq[(size_t)(r * n + i)];
+                            const double d = std::fabs(a - b);
+                            if (std::fabs(b) > dqmax_seen) dqmax_seen = std::fabs(b);
+                            for (int k = 0; k < 4; ++k) {
+                                if (d <= top[k].d) continue;
+                                for (int m = 3; m > k; --m) top[m] = top[m - 1];
+                                top[k].d = d;
+                                top[k].r = r;
+                                top[k].i = i;
+                                break;
+                            }
+                        }
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        if (top[k].i < 0) continue;
+                        const int64_t r = top[k].r, i = top[k].i;
+                        const double s = srow[(size_t)r];
+                        const double xv = call.fwd[0].value[(size_t)(r * n + i)];
+                        const double gv =
+                            call.fwd.size() > 2 && (int64_t)call.fwd[2].value.size() > i
+                                ? call.fwd[2].value[(size_t)i]
+                                : 0.0;
+                        const double nv = xv * s;
+                        const double dv = dq[(size_t)(r * n + i)];
+                        const double yv = y[0].value[(size_t)(r * n + i)];
+                        // The one hypothesis a per-element gain cannot produce: if the kernel's
+                        // value at COLUMN i is x_{r',i} * s_{r'} * (g_i+1) for a DIFFERENT row r',
+                        // the snapshot handed to this row is row-misaligned, which is a defect of
+                        // an in-place read served from a boundary, not of the norm's arithmetic.
+                        int64_t best_r = -1;
+                        double best_d = 0.0;
+                        for (int64_t rx = 0; rx < rows; ++rx) {
+                            const double cand =
+                                call.fwd[0].value[(size_t)(rx * n + i)] * srow[(size_t)rx] *
+                                (gv + 1.0);
+                            const double d = std::fabs(cand - dv);
+                            if (best_r < 0 || d < best_d) {
+                                best_d = d;
+                                best_r = rx;
+                            }
+                        }
+                        std::fprintf(stderr,
+                                     "DEQELEM pos=%lld rank=%d r=%lld i=%lld dq=%.6g y=%.6g "
+                                     "x=%.6g n=%.6g g=%.6g dq_over_n=%.6g g_plus_1=%.6g "
+                                     "y_over_dq=%.6g bestrow=%lld bestval=%.6g\n",
+                                     (long long)call.rec.position, k, (long long)r, (long long)i, dv,
+                                     yv, xv, nv, gv, nv != 0.0 ? dv / nv : 0.0, gv + 1.0,
+                                     dv != 0.0 ? yv / dv : 0.0, (long long)best_r,
+                                     best_r >= 0
+                                         ? call.fwd[0].value[(size_t)(best_r * n + i)] *
+                                               srow[(size_t)best_r] * (gv + 1.0)
+                                         : 0.0);
+                    }
+                    std::fprintf(stderr,
+                                 "DEQELEM pos=%lld op=%s worst=%.6g deqmax=%.6g deq_err=%.6g "
+                                 "deq_rel=%.6g\n",
+                                 (long long)call.rec.position, call.rec.op.c_str(), top[0].d,
+                                 dqmax_seen, deq_err, deq_scale > 0.0 ? deq_err / deq_scale : deq_err);
+                    // The one thing the plain `rmsnorm` (which NORMELEM shows matches to 0.28%)
+                    // does not share with a fused norm: which operand is the elementwise input.
+                    // The plain norm's input is operand 0 and the row takes `call.fwd[0]`; the
+                    // fused record reads operand 0 (`h`) and operand 1 (`x`, in place), and the
+                    // elementwise part may take the other one. Rebuild `y` from operand 1 and
+                    // compare over the WHOLE tensor, so the answer is a scalar and not a
+                    // max-biased sample. A match here names the input operand; no match leaves
+                    // the fused stage itself.
+                    if (call.fwd.size() > 1 &&
+                        call.fwd[1].value.size() == call.fwd[0].value.size()) {
+                        double w1 = 0.0, sc1 = 0.0, fwd1_vs_dq = 0.0;
+                        for (int64_t r = 0; r < rows; ++r) {
+                            double ss = 0.0;
+                            for (int64_t j = 0; j < n; ++j) {
+                                const double v = call.fwd[1].value[(size_t)(r * n + j)];
+                                ss += v * v;
+                            }
+                            const double s1 = 1.0 / std::sqrt(ss / (double)n + 1e-6);
+                            for (int64_t i = 0; i < n; ++i) {
+                                const double gv =
+                                    call.fwd.size() > 2 &&
+                                            (int64_t)call.fwd[2].value.size() > i
+                                        ? call.fwd[2].value[(size_t)i]
+                                        : 0.0;
+                                const double y1 = call.fwd[1].value[(size_t)(r * n + i)] * s1 *
+                                                  (gv + 1.0);
+                                const double d =
+                                    std::fabs(y1 - dq[(size_t)(r * n + i)]);
+                                if (d > w1) w1 = d;
+                                const double dq1 =
+                                    std::fabs(call.fwd[1].value[(size_t)(r * n + i)] -
+                                              dq[(size_t)(r * n + i)]);
+                                if (dq1 > fwd1_vs_dq) fwd1_vs_dq = dq1;
+                                if (std::fabs(dq[(size_t)(r * n + i)]) > sc1)
+                                    sc1 = std::fabs(dq[(size_t)(r * n + i)]);
+                            }
+                        }
+                        std::fprintf(stderr,
+                                     "DEQELEM pos=%lld op=%s operand1_worst=%.6g operand1_rel=%.6g "
+                                     "(operand0_rel=%.6g) fwd1_vs_dq_rel=%.6g\n",
+                                     (long long)call.rec.position, call.rec.op.c_str(), w1,
+                                     sc1 > 0.0 ? w1 / sc1 : w1,
+                                     deq_scale > 0.0 ? deq_err / deq_scale : deq_err,
+                                     fwd1_vs_dq > 0.0 ? fwd1_vs_dq / (sc1 > 0.0 ? sc1 : 1.0) : 0.0);
+                    }
+                    std::fflush(stderr);
+                }
             }
             std::fprintf(stderr, "DUMPROT pos=%lld op=%s rot_err=%.6g rot_bad=%lld/%zu deq_rel=%.6g\n",
                          (long long)call.rec.position, call.rec.op.c_str(), rot_err,
@@ -1418,13 +1572,31 @@ void fused_adjoint(const AdjointCall& call, Part part) {
     // value the twin writes is the part's output, so its cotangent reaches the part's input
     // through the part, exactly as the quantiser's does -- a passthrough would differentiate
     // the slot at the identity, and the slot holds `part(x)`, not `x`.
-    std::vector<AdValue> ecot = {qdc[0]};
+    // The residual's incoming cotangent (the new residual value's consumers) is the part record's
+    // write #0, before the intermediate. The elementwise part adds it to both summands' slots with
+    // the norm's input cotangent (the `add` rule), so it is handed as its own cotangent -- not
+    // folded into the intermediate's, which would run the external consumer's cotangent through
+    // the norm's Jacobian, where it does not belong.
+    const int64_t residual_at = (part == Part::rmsnorm) ? rmsnorm_residual(call.rec) : -1;
+    std::vector<AdValue> ecot;
+    if (residual_at >= 0) {
+        const int64_t res_cot = cot_slot(call.rec, residual_at);
+        if (res_cot < 0 || (size_t)res_cot >= call.cot.size())
+            throw std::invalid_argument(std::string("quant: ") + call.rec.op +
+                                        ": the residual write '" +
+                                        call.rec.operands[(size_t)residual_at].buffer +
+                                        "' has no cotangent slot");
+        ecot.push_back(call.cot[(size_t)res_cot]);
+    }
+    // The intermediate's cotangent: the quantiser's, joined below by the record's other writes of
+    // the part's width (the `out_bf16` junction).
+    ecot.push_back(qdc[0]);
     // The direct path's width, the elementwise input: both halves for the gated producer, one
     // row of it for the rest -- the device row's `out_slot` (src/adjoint/device/quant.hip:700).
     const int64_t out_slot = part == Part::silu_mul ? 2 * total : total;
     for (int64_t j = 0; j < (int64_t)call.rec.operands.size(); ++j) {
         const Operand& o = call.rec.operands[(size_t)j];
-        if (!o.written || j == codes_at || j == scale_at) continue;
+        if (!o.written || j == codes_at || j == scale_at || j == residual_at) continue;
         const int64_t at = cot_slot(call.rec, j);
         if (at < 0 || (size_t)at >= call.cot.size())
             throw std::invalid_argument(std::string("quant: ") + call.rec.op +
@@ -1434,7 +1606,7 @@ void fused_adjoint(const AdjointCall& call, Part part) {
         if (out_values == 0 || out_values == 1)
             continue;  // no consumers, or the engine's no-value placeholder: nothing to add
         if (out_values == total) {
-            for (size_t e = 0; e < oc.value.size(); ++e) ecot[0].value[e] += oc.value[e];
+            for (size_t e = 0; e < oc.value.size(); ++e) ecot.back().value[e] += oc.value[e];
             continue;
         }
         int64_t read_at = -1;

@@ -265,7 +265,8 @@ __global__ void gate_back_kernel(const float* rotated_cot, const float* gate, co
 // The RMS norm, one block per row: ss = sum x^2 and t = sum r x c share the row's reduction, c =
 // w + wadd. dx_j = mult * (rs c_j r_j - rs^3 x_j t / n), the row's shared term carried by every
 // element. ss and t accumulate in f64 -- the note below says why; the gain is frozen (the host
-// rmsnorm adjoint leaves it), so only x's cotangent comes back.
+// rmsnorm adjoint leaves it), so only the norm input's cotangent comes back. On a record with a
+// residual the caller hands the sum's snapshot as `x` (the row), so this body is unchanged.
 __global__ void rmsnorm_back_kernel(const float* rotated_cot, const float* x, const float* w,
                                     unsigned short* dx, int64_t n, float eps, float wadd,
                                     float mult) {
@@ -693,6 +694,27 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if ((int64_t)cot.value.size() < rows * codes_n)
         short_operand("codes cotangent", cot.value.size(), rows * codes_n);
 
+    // The residual operand: the schema's `residual`, an INOUT write the record also reads. The
+    // tape snapshots an in-out operand after the issue, so operand 1's snapshot already holds the
+    // narrowed sum v = x + residual_old -- the sum the reference normalises and reads back
+    // (ref_quant.cpp:184-186), and the sum whose cotangent the row splits onto both summands. The
+    // row used operand 0 instead, and the fused norm's own activation then disagreed with it at
+    // every site. A record without one behaves exactly as before. `written && in_place` is the
+    // marker: the elementwise output is a write too, but it is not the value it replaced.
+    int64_t res_at = -1;
+    if (part == Part::rmsnorm) {
+        for (int64_t k = 0; k < operands; ++k) {
+            const Operand& o = call.rec.operands[(size_t)k];
+            if (!o.written || !o.in_place || k == codes_at || k == scale_at) continue;
+            res_at = k;
+            break;
+        }
+        if (res_at >= 0 && (int64_t)call.fwd[(size_t)res_at].value.size() !=
+                               (int64_t)call.fwd[0].value.size())
+            short_operand("residual", call.fwd[(size_t)res_at].value.size(),
+                          call.fwd[0].value.size());
+    }
+
     // What the backprop reads: the elementwise operands' widths, and the slots it answers for.
     const int64_t arg_count = part == Part::quant ? 0
                               : part == Part::rmsnorm ? total + n
@@ -767,8 +789,14 @@ void quant_adjoint(const AdjointCall& call, Part part) {
             ++admitted;
             const int64_t b = r * n;
             double ss = 0.0;
-            for (int64_t i = 0; i < n && std::isfinite(ss); ++i)
-                ss += call.fwd[0].value[(size_t)(b + i)] * call.fwd[0].value[(size_t)(b + i)];
+            for (int64_t i = 0; i < n && std::isfinite(ss); ++i) {
+                // The live row's activation is v = x + residual (operand 1's snapshot, when the
+                // record carries one), so a non-finite residual refuses the same way x would.
+                const double v = res_at >= 0
+                                     ? call.fwd[(size_t)res_at].value[(size_t)(b + i)]
+                                     : call.fwd[0].value[(size_t)(b + i)];
+                ss += v * v;
+            }
             if (!std::isfinite(ss)) ++refused;
         }
         count_read_rows(call.row_count, call.read_rows, zeroed, admitted, refused);
@@ -826,7 +854,13 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     // Reusing one block is safe: every memcpy and launch below is on `s`, in program order.
     device::ScratchBlock d_out_cot(total * (int64_t)sizeof(float));
     for (int64_t j = 0; j < operands; ++j) {
-        if (!call.rec.operands[(size_t)j].written || j == codes_at || j == scale_at) continue;
+        // The residual is a write too, but its cotangent is the in-place buffer's own dL/dv (its
+        // consumers'), not the elementwise output's: it belongs on BOTH summands of v = x +
+        // residual, which the split below does. Leaving it out of this loop keeps it off the
+        // rotation, where it would enter the norm's Jacobian as if it were dy.
+        if (!call.rec.operands[(size_t)j].written || j == codes_at || j == scale_at ||
+            j == res_at)
+            continue;
         const int64_t at = cot_slot(call.rec, j);
         if (at < 0 || (size_t)at >= call.cot.size())
             throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op +
@@ -888,10 +922,13 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if (arg_count > 0) {
         std::vector<float> h_arg((size_t)arg_count);
         // The gated producer's first operand is gate_up, both halves of it; the others' is one
-        // row of the elementwise op's input.
+        // row of the elementwise op's input. With a residual the input is operand 1's snapshot --
+        // the narrowed sum, already written back by the forward -- not operand 0; without one it
+        // is operand 0, exactly as before.
+        const AdValue& norm_in = res_at >= 0 ? call.fwd[(size_t)res_at] : call.fwd[0];
         const int64_t first = part == Part::gated ? 2 * total : total;
         for (int64_t i = 0; i < first; ++i)
-            h_arg[(size_t)i] = (float)call.fwd[0].value[(size_t)i];
+            h_arg[(size_t)i] = (float)norm_in.value[(size_t)i];
         if (part == Part::rmsnorm || part == Part::gate) {
             const AdValue& second = call.fwd[(size_t)second_at];
             const int64_t count = part == Part::rmsnorm ? n : total;
@@ -940,6 +977,33 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     add_back((unsigned short*)d_out.p, out_slot, call.dc->at(0), s,
              part == Part::rmsnorm ? n : 0, part == Part::rmsnorm ? call.read_rows : nullptr);
     if (part == Part::gate) add_back((unsigned short*)d_out.p + total, total, call.dc->at(1), s);
+    // v = x + residual_old is a two-input sum, so the cotangent of v -- the norm's `dv` plus the
+    // incoming cotangent g_r of the new residual value (its external consumers' dL/dv, which the
+    // direct-path loop above kept off the rotation) -- lands on BOTH summands at full weight, as
+    // `add` does. Each slot gets one copy of dv and one of g_r; with dv = 0 the row reduces to
+    // `add` (both slots get g_r once). The residual is an INOUT write: the walk would otherwise
+    // pass its own cotangent through into its read slot (src/backward.cpp's in-place passthrough),
+    // so the row writes that slot's two terms explicitly here and the passthrough -- which fires
+    // only on an all-zero slot -- leaves it alone.
+    if (part == Part::rmsnorm && res_at >= 0) {
+        AdValue& dres = call.dc->at((size_t)res_at);
+        if ((int64_t)dres.value.size() != total)
+            throw std::runtime_error("r97: quant adjoint: op '" + call.rec.op + "' at " +
+                                     std::to_string(call.rec.position) +
+                                     ": the residual's gradient slot has " +
+                                     std::to_string(dres.value.size()) + " values, the row needs " +
+                                     std::to_string(total));
+        add_back((unsigned short*)d_out.p, total, dres, s, n, call.read_rows);
+        const int64_t res_cot_at = cot_slot(call.rec, res_at);
+        if (res_cot_at >= 0 && (size_t)res_cot_at < call.cot.size()) {
+            const AdValue& gr = call.cot[(size_t)res_cot_at];
+            if ((int64_t)gr.value.size() == total)
+                for (int64_t i = 0; i < total; ++i) {
+                    call.dc->at(0).value[(size_t)i] += gr.value[(size_t)i];
+                    dres.value[(size_t)i] += gr.value[(size_t)i];
+                }
+        }
+    }
     if (const char* dq = std::getenv("R97_DUMP_QUANT"); dq != nullptr && dq[0] == '1') {
         double sd = 0.0;
         for (double v : call.dc->at(0).value) sd += std::fabs(v);

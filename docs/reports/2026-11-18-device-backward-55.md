@@ -99,8 +99,8 @@ leaves. The two runs differ — the `R97_CENTRAL` run's walk norm 7.92e38 agains
 7.63e38, its default-loss after 7400.96052 against 7403.47027, its clipped probes −175.09/−43.93
 against −149.83/−71.72 — consistent with the f32 accumulation's order dependence at the walk's
 ~1e38 scale, while the FD's central differences agree to the digit (948.917 and −74358.9 in both).
-#55 stays open on the magnitude; the next fix is the per-block amplification, starting at the
-last block (the first divergent one).
+#55 stays open on the magnitude; the section below carries what the error is — a uniform ~x3.7 per
+block gain, not a top-block offset — and the candidate site.
 
 ## The 4096-token ticket case
 
@@ -121,6 +121,192 @@ gradient is non-finite. The restores still happen (`in_place_restores 63`; the c
 the coverage probe, so `in_place_expected -1`). The next piece of work is the `gemm_nt_q` row's
 range — an f64 carry (or a per-row scale) for the activation cotangent and the staged weight
 gradient — not a change to the host fallback.
+
+## The per-block gain, against the full device walk
+
+`R97_WALK_BLOCKS` limits **the host walk only** (`src/step_device.cpp:1220-1231`, deliberate: a
+truncated walk zero-fills what it skipped, which would silence the very A/B it exists for). A device
+arm run with `R97_WALK_BLOCKS=14` therefore still walks all 64 blocks, and its `grad norm 8.10e38`
+is a full-walk norm — it is **not** comparable with a host 14-block `6.25e8`. Reading those two as an
+A/B is a scope error, not a device/host disagreement.
+
+What *is* comparable is the cotangent table at the positions both arms reach. The host 14-block
+(blocks 50..63) and the device full walk agree at all 28 of those positions, within 1.25-1.45x — the
+device slightly the larger, as its bf16 operands predict:
+
+| pos | block | host | device |
+|---|---|---|---|
+| 1449 | 63 ffn | 7.25985e-06 | 7.24196e-06 |
+| 1429 | 63 attn | 2.62647e-06 | 2.563e-06 |
+| 1366 | 60 attn | 4.81279e-05 | 4.98295e-05 |
+| 1358 | 59 ffn | 2.0516e-03 | 2.2583e-03 |
+| 1148 | 50 ffn | 180.998 | 262 |
+| 1135 | 50 attn | 40.267 | 72.5 |
+
+The device walk continues below block 50 with no host counterpart: 1127 (49 ffn) 1344, 1106 (48
+ffn) 9792, 1023 9.37e04, 924 5.58e08, 812 5.03e11, 693 6.33e14, 560 2.83e18, 448 1.78e21, 357
+2.98e23, 238 1.56e27, 126 3.69e30, **14 (block 0 ffn) 7.05e33**. Head to foot is 40.7 decades over
+64 blocks: the walk multiplies the `h` cotangent by **~4.3 per block** (median per-block ratio
+4.2; 60->59 is x7.3, 50->49 x2.8).
+
+**The true cotangent is flat.** The FD ladder puts the true leaf gradients at O(1)..O(150)
+*mean-loss* across all 64 blocks, so the true per-block gain is ~x1.0, and the walk's ~x4.3 is the
+whole error: block 63 too small by 249x and block 0 too large by 4.6e33 is a *pure* per-block gain
+error of (4.6e33 x 249)^(1/63) = **x3.7 per block**, with no separate top-block offset needed. The
+walk's measured x4.0-4.3 per block is the same number to within the FD's two-point estimate.
+
+The 11-15 report's signature survives: the residual `x` path stays flat at 1.31e-07 while the `h`
+path grows. `h` crosses exactly **two** fused norms per block (its `ffn_norm` and `attn_norm`), so a
+factor of two at each is a x4/block gain on the `h` path alone, and the in-place `h` fill is the
+candidate. The fused norms are **not** amplifying in their own right: `DUMPNORM`'s `dy_sum` against
+`DUMPQUANT`'s `quant_dx + dx` is 1.0 within 3% at every record (1429: 181.144 vs 181.57; 1408:
+391.66 vs 387.92; 1400: 485.412 vs 498.63; 1387: 950.038 vs 940.05), so the rows are unit-gain.
+
+That measurement does **not** clear the walk, which is why the in-place `h` fill stays the candidate:
+a double-count at the walk level would hand each norm an already-doubled cotangent, so `dy_sum`
+inflates with it and the ratio above stays ~1.0. The sites to separate are the row's own write to
+the `h` slot beside the passthrough fill, the record's two `h` slots being summed instead of one
+being taken, and the distribution of the write's cotangent to the replaced version.
+
+A `gdn_gated_rmsnorm` instance amplifies x1.5e4 in one step (pos 1416 leaves `dc[gdn_o] = 3.14662`
+against the `2.09146e-04` handed to it at 1417), but that is not the per-block gain: the `dc[gdn_o]`
+sequence across gated norms climbs x2-8 per block (3.15, 6.50, 23.4, 299, 925, 7304, 6.28e4,
+1.88e5, 4.48e5, 1.52e7), the same x3.8/block as the `h` path, so something inside each block
+compensates it by ~x1e4. The row's internal `dc[gdn_o]/dc[gdn_in]` is ~1800-3000 ~= `sc` at every
+instance.
+
+### The gain is the container's weight, and the norm is the only row family that disagrees
+
+Four readings close every element-level candidate on the fused norm's gain:
+
+- **The operand is rank 1.** `DUMPDC` prints `buffer=blk.63.ffn_norm.weight shape=[5120]` for all 28
+  fused-norm records, so the record declares the weight itself, not a `[rows, n]` per-row tensor.
+  `R97_GAIN_ROW=1` is therefore inert (`FDRMS ... w_rank=1 w0=5120 per_row=0`), and "no collapse"
+  in that A/B says nothing about the kernel. The `elementwise.cpp:387-390` comment describing a
+  `[512,5120]` arrival is stale symptom text of the #157 mis-taken-intermediate bug that
+  `quant.cpp:1376-1403` fixed.
+- **Its values are the container's**, read offline by `tools/dump_weight.cpp` (`rad::RadFile`, mmap,
+  no engine, no GPU): `blk.63.ffn_norm.weight` `0.2451171875, 0.146484375, 0.2099609375,
+  0.2138671875`, `blk.63.attn_norm.weight` `0.07568359375, 0.171875, 0.11328125, 0.080078125`,
+  `output_norm.weight` `0.9609375, 0.75, 0.9375, 0.828125` -- all `scheme=plain`, bf16, one plane.
+  The gain the walk took is the same to the bf16 digit (`GAINPOS pos=1449 ... vals=[0.245117,
+  0.146484, 0.209961, 0.213867]`, and the same line for the twin and the adjoint).
+- **Gain-after-rotation is closed.** `y2_rel` tracks `deq_rel` at every norm (1449: 1.362 vs 1.364;
+  1379: 1.479 vs 1.490), and at the gates `y2_rel` is 1e4 while `deq_rel` is 0.004, so the shape test
+  does not discriminate.
+- **The twin's elementwise output is not the kernel's value.** `deq_vs_write` of 3e-4 / 1e-5 proves
+  `dq` -- reconstructed from the kernel's own codes and scale -- *is* the value the kernel stored,
+  and the twin's `y` differs from that same tensor by 1.36 at every fused norm, while all 14
+  `gated_had_quant_i8g` and 6 `gate_had_quant_i8g` records match at 0.0034-0.0078. The difference is
+  not a per-row scale (`row_ratio` 0.988-1.056) and sorting does not remove it (`sort_rel` 0.33-0.52,
+  against 0.0037-0.0045 at the gates), so it is not a permutation either.
+
+With `w` correct and `s = 1/rms(x)` derived from `x`, `y = x*s*(w+1)`: a *scaled* wrong `x` cannot
+explain the difference, because `s` cancels the scale. What is left is the `h` snapshot's **vector**
+or a structural difference in the kernel's norm.
+
+### The fused norm's `residual` operand: the row differentiates the wrong vector
+
+`rmsnorm_had_quant_i8g`'s operands are `x`, `residual`:inout?, `w`w -> `q`, `scale`, `out_bf16?`
+(`third_party/radiance/docs/OPS.md:739`), and `third_party/radiance/libref/ref_quant.cpp:149-206` --
+the fused op's own reference implementation, "what a plugin asks for first" -- defines the forward:
+
+```cpp
+const float v = res ? ldt(x, xb + i*xs) + ldt(res, rb + i*rst) : src(i);
+if (res) stt(res, rb + i*rst, v);      // residual = x + residual
+ss += v * v;                            // the variance is over the SUM
+...
+auto normed = [&](int64_t i) { return src(i) * sc * (ldt(w, i*ws) + wadd); };
+```
+
+with `src(i)` reading the residual *after* the update. Its comment states it outright: "With
+`residual` it is the fused_add_rms_norm form: the sum is written back to `residual` (INOUT; the next
+layer's shortcut reads it) and the norm is over the sum."
+
+**The row takes operand 0 alone.** `src/adjoint/host/elementwise.cpp:461` binds `x = op[0]` and the
+loop at `:518-527` never reads operand 1, so on every fused norm whose record carries a residual --
+every one on this container -- the row differentiates `rmsnorm(x)` where the kernel computed
+`rmsnorm(x + residual)`. That single wrong operand accounts for every exclusion above:
+
+| observation | explained by normalising `x` instead of `x + residual` |
+|---|---|
+| `deq_rel` 0.99-1.62 at all 28 fused norms, 0.0034-0.0078 at all 20 gate records | gates have no residual operand |
+| `row_ratio` 0.988-1.056 | `x` and `x + residual` are both residual-scaled vectors |
+| `sort_rel` 0.33-0.52, `y2_rel` tracking `deq_rel` | neither a permutation nor a rotation placement |
+| `bestrow` offsets scattered | not a row shift |
+| plain `rmsnorm` at 1458 matches to 0.28% (`NORMELEM`) | it has no residual operand |
+
+**Measured, not inferred.** The fused norm rebuilt from each candidate operand, against the
+kernel's own reconstructed activation (`DEQELEM ... operandN_rel` = `max|y_N - dq| / max|dq|`):
+
+| pos | `operand0_rel` (what the row uses) | `operand1_rel` |
+|---|---|---|
+| 1449 | 1.364 | **0.0080** |
+| 1429 | 1.046 | **0.0054** |
+| 1421 | 1.394 | **0.0087** |
+| 1408 | 1.203 | **0.0062** |
+| 1400 | 1.363 | **0.0088** |
+| 1387 | 1.426 | **0.0071** |
+| 1379 | 1.490 | **0.0087** |
+| 1366 | 0.986 | **0.0060** |
+
+and at a gate record the relationship inverts as the operands predict (operand 0 right at 0.0078,
+operand 1 meaningless at 31, because a gate has no residual operand). 0.5-0.9% is the same floor the
+gates and the plain `rmsnorm` sit at, so operand 1's snapshot *is* the norm's input: the tape
+snapshots an operand after the op issues, so the in-out residual's value is the narrowed sum
+`x + residual_old`, exactly what the reference's `src(i)` reads. The row therefore does not need to
+sum anything -- it needs to take operand 1 instead of operand 0, and split the input cotangent
+across the two summands.
+
+No test caught it: `tests/gpu/adjoint_quant.cpp:154-187` builds the fused shape **without** the
+in-place mark on operand 1, so the residual path is unexpressible in the fixture, and the host
+fixtures carry no residual at all.
+
+The backward has the matching hole: the sum's cotangent must reach *both* `x` and the residual's
+prior value, and the residual's own in-place write cotangent must be added to its slot. Today the
+residual slot is filled by the direct-path passthrough (`src/backward.cpp:803-812`), which is why
+the earlier trace of that slot found no row involvement.
+
+### The fix
+
+Both sides now take the residual operand's snapshot as the norm's input `v` -- no summation in the
+row, because the tape's post-issue snapshot already holds the narrowed sum -- and split the input
+cotangent as `add` does, one copy of each term per slot:
+
+- `src/adjoint/host/elementwise.cpp` -- `rmsnorm_residual` (by-role, with a named refusal on a size
+  mismatch); `rmsnorm_twin` and `rmsnorm_host_adjoint` take `v` from that operand; the row adds
+  `J_norm(dy) + cot_res` to **both** `dc[0]` and `dc[residual]` (`dv = 0` reproduces `add`); a
+  `NORMSCALE` print under `R97_GAIN_POS`.
+- `src/adjoint/host/quant.cpp` -- `fused_twin`'s residual slot carries the sum; `fused_adjoint`
+  builds `ecot = {g_r, qdc[0] + out_cot}` and **skips the residual in the fold**, which used to
+  mis-fold it into the intermediate's cotangent -- a second defect on the same record.
+- `src/adjoint/device/quant.hip` -- the mirror: kernel unchanged, `v` uploaded in place of operand
+  0, by-role `res_at` with a named refusal, the residual's cotangent kept off the rotation, both
+  slots receiving `dv + g_r` once (`:977-1006`), pure superset with no residual.
+- `tests/host/adjoint_rmsnorm_residual.cpp` (new) -- forward exact (`residual rel 0, normed rel 0`)
+  and gradient `rel 1.33e-10` on both slots against a finite difference of the same decomposition.
+  The FD zeroes the quantiser's `codes`/`scale` cotangents, which are piecewise constant in the
+  input and cannot be finite-differenced; with them live the test failed at 5.5% while measuring a
+  different function from the one the row differentiates.
+
+Two defects sat on this one record, and they are separable in kind. The **wrong input operand**
+changes *which function* the row differentiates -- the direction. The **fold in `fused_adjoint` that
+leaked the residual's cotangent `g_r` into the elementwise cotangent** is a walk-level double count
+*outside* the row: the residual stream's dominant cotangent was added to the norm's input cotangent
+at every fused norm. Only the second can explain the magnitude, and only the second is invisible to
+the in-row check -- `DUMPNORM`'s `dy_sum` against `DUMPQUANT`'s `quant_dx + dx` compares the row's
+output L1 with its input, both computed from whatever input the row was handed, so a gain error
+outside the row and a wrong input both leave it at ~1.0. That is also why that measurement, and the
+in-place passthrough's insensitivity, are consistent rather than contradictory.
+
+The growth's disappearance (below) was measured with **both** fixes in place. Which of the two
+removed it is the mechanism above -- consistent with the insensitivity, and the only one of the two
+that can produce a per-block factor -- but it has not been A/B'd against the input change alone.
+
+Two follow-ups carried, not fixed: `rmsnorm_quant_fp8` is a separate row in `quant_fp8.cpp` and is
+not in this container's program; and `R97_REGISTER_ADJOINT_IF_F(..., rotated, 1)` freezes operand 1,
+which is the gain in the no-residual layout and the residual in the residual layout -- it works
+because the walk sizes an in-place frozen slot anyway, but it is misaligned with the op's schema.
 
 ## Tests
 
