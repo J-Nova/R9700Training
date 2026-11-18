@@ -87,13 +87,14 @@ two ends of the stack:
 The last layer is already wrong — 250x too small, above the in-place reads #157 fixed — and the
 error compounds downward, crossing 1 and reaching 4.6e33x at the bottom. The true leaf gradients
 are O(1)..O(150) mean-loss; the walk's ~1e38 norm is the compounding, not the checkpoint's
-Jacobian. The clipped 1e-3 probe agrees: its -175.09 sum-loss change over the leaves the unit
-step moves puts their true mean-loss gradients at O(0.1)..O(1), not 1e38. The unclipped
-3e-4/1e-4 probes only move leaves with |g| < 1.8e19 (f32 `v` is Inf above), so their descent
-tests the moderate leaves' direction only. (The `R97_CENTRAL` run's step was 963.0 s — the host
-slower that evening, bwd 886.5 — against the gate run's 342.4 s; the values agree.) #55 stays
-open on the magnitude; the next fix is the per-block amplification, starting at the last block
-(the first divergent one).
+Jacobian. The clipped probes are **direction-only**: the clip scales the step by `lr/norm`, not
+`lr*sign(g)`, so their loss changes are not a first-order estimate of the true gradients' L1 and
+are not used here for magnitude. The unclipped 3e-4/1e-4 probes only move leaves with
+|g| < 1.8e19 (f32 `v` is Inf above), so their descent tests the moderate leaves' direction only.
+(The `R97_CENTRAL` run's walk norm was 7.92e38 — the gate run's 7.63e38 — and its clipped probes
+−175.1 at 1e-3 and −43.9 at 1e-4; its step was 963.0 s, bwd 886.5, against the gate run's
+342.4 s, the host slower that evening; the values agree.) #55 stays open on the magnitude; the
+next fix is the per-block amplification, starting at the last block (the first divergent one).
 
 ## The 4096-token ticket case
 
