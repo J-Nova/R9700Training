@@ -694,18 +694,27 @@ void quant_adjoint(const AdjointCall& call, Part part) {
     if ((int64_t)cot.value.size() < rows * codes_n)
         short_operand("codes cotangent", cot.value.size(), rows * codes_n);
 
-    // The residual operand: the schema's `residual`, an INOUT write the record also reads. The
-    // tape snapshots an in-out operand after the issue, so operand 1's snapshot already holds the
-    // narrowed sum v = x + residual_old -- the sum the reference normalises and reads back
-    // (ref_quant.cpp:184-186), and the sum whose cotangent the row splits onto both summands. The
-    // row used operand 0 instead, and the fused norm's own activation then disagreed with it at
-    // every site. A record without one behaves exactly as before. `written && in_place` is the
-    // marker: the elementwise output is a write too, but it is not the value it replaced.
+    // The residual operand: the schema's `residual`, an INOUT write the record also reads -- and
+    // the one whose logical shape is the norm's input. The shape test is not decoration. The live
+    // tape carries a PHANTOM in-place write (buffer `none:1`, one value) ahead of the residual, so
+    // `written && in_place` alone selects a tensor that is not the residual at all; the row then
+    // refused on that operand's size and the whole walk died:
+    //   "quant adjoint: op 'rmsnorm_had_quant_i8g' at 1: operand 'residual' has 1 values, the row
+    //    needs 2621440"
+    // The declared shape separates them. The size check below still refuses rather than falling
+    // back when the operand that HAS the residual's shape carries no values.
+    //
+    // The tape snapshots an in-out operand after the issue, so that operand's snapshot already
+    // holds the narrowed sum v = x + residual_old -- the sum the reference normalises and reads
+    // back (ref_quant.cpp:184-186), and the sum whose cotangent the row splits onto both summands.
+    // The row used operand 0 instead, and the fused norm's own activation then disagreed with it at
+    // every site. A record without one behaves exactly as before.
     int64_t res_at = -1;
     if (part == Part::rmsnorm) {
         for (int64_t k = 0; k < operands; ++k) {
             const Operand& o = call.rec.operands[(size_t)k];
             if (!o.written || !o.in_place || k == codes_at || k == scale_at) continue;
+            if (o.shape != call.rec.operands[0].shape) continue;
             res_at = k;
             break;
         }

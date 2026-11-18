@@ -153,7 +153,12 @@ void fused_tape_shapes() {
         std::vector<AdValue> fwd;
         if (sp.part == Part::rmsnorm) {
             rec.operands.push_back(read_operand("x", rows, n));
-            rec.operands.push_back(Operand{"none:1", "invalid", {}, 0, 0, true});
+            // The live tape's phantom write is IN PLACE as well as written (`Operand`'s order is
+            // `... rows, written, in_place`), and that is the whole point: a by-role scan for the
+            // residual that tests only `written && in_place` picks this operand -- one value where
+            // the norm needs rows*n -- and the walk dies on it. This case carried `written` alone,
+            // so it could not see that; the declared shape is what must separate them.
+            rec.operands.push_back(Operand{"none:1", "invalid", {}, 0, 0, true, true});
             rec.operands.push_back(Operand{"w", "bf16", {n}, 0, 1, false});
             fwd.push_back(device_check::random_value("bf16", {rows, n}, &seed));
             fwd.emplace_back();
