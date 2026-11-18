@@ -87,14 +87,20 @@ two ends of the stack:
 The last layer is already wrong — 250x too small, above the in-place reads #157 fixed — and the
 error compounds downward, crossing 1 and reaching 4.6e33x at the bottom. The true leaf gradients
 are O(1)..O(150) mean-loss; the walk's ~1e38 norm is the compounding, not the checkpoint's
-Jacobian. The clipped probes are **direction-only**: the clip scales the step by `lr/norm`, not
-`lr*sign(g)`, so their loss changes are not a first-order estimate of the true gradients' L1 and
-are not used here for magnitude. The unclipped 3e-4/1e-4 probes only move leaves with
-|g| < 1.8e19 (f32 `v` is Inf above), so their descent tests the moderate leaves' direction only.
-(The `R97_CENTRAL` run's walk norm was 7.92e38 — the gate run's 7.63e38 — and its clipped probes
-−175.1 at 1e-3 and −43.9 at 1e-4; its step was 963.0 s, bwd 886.5, against the gate run's
-342.4 s, the host slower that evening; the values agree.) #55 stays open on the magnitude; the
-next fix is the per-block amplification, starting at the last block (the first divergent one).
+Jacobian. The clipped probes are a **first-order estimate**, not direction-only: `clip_impl` clips
+the gradient before the moments (`src/optim.cpp:264`) and AdamW's `mh/sqrt(vh)` cancels the clip's
+scale (`:289-293`), so a dominant leaf's step is ~`lr*sign(g)`. The FD run's clipped 1e-3 loss
+change is −175.09, i.e. `sum(g_true*sign(g_walk)) = 1.75e5` sum-loss (342 mean over 511); the FD's
+two leaves — block 0 74,358.9 and block 63 948.9 — are 43% of it. The 1e-4 clipped probe gives
+4.39e5 (859 mean); the 1e-3 step is past the linear regime, so the two bracket the nonlinearity,
+and both are O(1e2)..O(1e3) mean-loss, not 1e38. The *unclipped* probes are the direction-only
+ones: the dominant leaves' f32 `v` is Inf above |g| ~1.8e19, so they move only the moderate
+leaves. The two runs differ — the `R97_CENTRAL` run's walk norm 7.92e38 against the gate run's
+7.63e38, its default-loss after 7400.96052 against 7403.47027, its clipped probes −175.09/−43.93
+against −149.83/−71.72 — consistent with the f32 accumulation's order dependence at the walk's
+~1e38 scale, while the FD's central differences agree to the digit (948.917 and −74358.9 in both).
+#55 stays open on the magnitude; the next fix is the per-block amplification, starting at the
+last block (the first divergent one).
 
 ## The 4096-token ticket case
 
