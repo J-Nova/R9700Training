@@ -1007,6 +1007,10 @@ void quant_adjoint(const AdjointCall& call, Part part) {
         if (res_cot_at >= 0 && (size_t)res_cot_at < call.cot.size()) {
             const AdValue& gr = call.cot[(size_t)res_cot_at];
             if ((int64_t)gr.value.size() == total)
+                // Both summands carry v's full cotangent, and the finite difference of v = x +
+                // residual_old is what proves it: with `g_r` on the residual slot alone the x slot
+                // is wrong by 25% (tests/host/adjoint_rmsnorm_residual.cpp, dc[0] rel 0.247 against
+                // 1.33e-10 with the term present). One copy of `dv` and one of `g_r` per slot.
                 for (int64_t i = 0; i < total; ++i) {
                     call.dc->at(0).value[(size_t)i] += gr.value[(size_t)i];
                     dres.value[(size_t)i] += gr.value[(size_t)i];

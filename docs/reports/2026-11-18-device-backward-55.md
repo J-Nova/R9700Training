@@ -308,6 +308,43 @@ not in this container's program; and `R97_REGISTER_ADJOINT_IF_F(..., rotated, 1)
 which is the gain in the no-residual layout and the residual in the residual layout -- it works
 because the walk sizes an in-place frozen slot anyway, but it is misaligned with the op's schema.
 
+### The remaining per-block factor is the residual handoff, not the row
+
+After the residual-operand fix the walk's cotangents decay ~x0.3 per block instead of growing ~x3.8
+(the FD ladder at blocks 63 and 0 puts the leaf 2.2e7x and ~1e39x too small, a uniform 3.2x/block).
+The row is not the cause: its split is proven against a finite difference of `v = x + residual_old`
+(both slots 1.33e-10) and the same-term A/B is refuted by that test -- `dc[0]` reads 0.247 with `g_r`
+off the branch slot. The live walk confirms the rule too: `l1_dx == l1_dx_res` at all eight fused
+norms (`R97_GAIN_POS=1`, `SPLIT`).
+
+What is broken is which terms reach the row (`SPLIT` at the eight fused norms):
+
+| pos | block | `l1_dy` | `l1_cot_res` | `l1_dx` |
+|---|---|---|---|---|
+| 1449 | 63 ffn | 15.71 | 0.02845 | 0.02926 |
+| 1429 | 63 attn | 3.994 | 0.02926 | 0.02931 |
+| 1421 | 62 ffn | 16.88 | **0** | 0.007908 |
+| 1408 | 62 attn | 0.5828 | 0.007908 | 0.007912 |
+| 1400 | 61 ffn | 4.745 | **0** | 0.002366 |
+| 1387 | 61 attn | 0.1752 | 0.002366 | 0.002367 |
+| 1379 | 60 ffn | 1.295 | **0** | 0.000647 |
+| 1366 | 60 attn | 0.04298 | 0.000647 | 0.000648 |
+
+`l1_cot_res` -- the residual write's incoming cotangent -- is **exactly zero at every ffn norm**, so
+the row's output there is `dv` alone (0.007908 against an input of 0.02926): the accumulated
+residual cotangent is discarded as the chain crosses each block. That is the x0.27/block, measured
+rather than inferred.
+
+The mechanism is in the distribution (`src/backward.cpp:1021-1047`): an in-place write's cotangent
+travels to the version its **read segments** name, and `DEVRESTORE` shows the attn norm's residual
+read being served from the **block-boundary store** rather than from the version the previous
+block's ffn norm wrote. With `seg.version < 0` that cotangent leaves the block via `add_input_full`
+instead of feeding the previous writer's version, so the ffn norm's write has no reader in the
+version graph, `cot_res` is 0, and its `dc[residual]` carries only the norm's own small term. The
+block handoff still works -- the cotangent does reach the next block's attn norm through `incoming`
+-- but the ffn norm's slot, and with it the feedback the `add` half of the fusion owes that write,
+is dropped every block.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new

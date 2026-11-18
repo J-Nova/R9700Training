@@ -685,16 +685,36 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
         for (int64_t i = 0; i < n; ++i) {
             const double c = w ? w->value[(size_t)i] + wadd : 1.0;
             const double shared = s * s * s * x.value[(size_t)(b + i)] * t / (double)n;
-            // v = x + residual_old's cotangent, carried in full by BOTH summands (the `add` rule,
-            // docs/reports/2026-11-15-device-backward-cotangent-growth.md): the norm's input term
-            // `dv` plus the residual write's own incoming cotangent. With `dv = 0` the row reduces
-            // to `add`, both slots getting the residual's cotangent once.
+            // v = x + residual_old's cotangent is carried in full by BOTH summands -- the norm's
+            // input term `dv` plus the residual write's own incoming cotangent. This is not a
+            // convention: the finite difference of that sum proves it, and putting the term on the
+            // residual slot alone leaves the x slot wrong by 25% (dc[0] rel 0.247 against 1.33e-10;
+            // tests/host/adjoint_rmsnorm_residual.cpp). With `dv = 0` the row reduces to `add`.
             const double d = mult * (s * c * dy.value[(size_t)(b + i)] - shared) +
                              (cot_res ? cot_res->value[(size_t)(b + i)] : 0.0);
             dx.value[(size_t)(b + i)] += d;
             if (dx_res) dx_res->value[(size_t)(b + i)] += d;
         }
     });
+    // R97_GAIN_POS=1: what the split actually carries. The row's maths is proven against a finite
+    // difference in isolation (tests/host/adjoint_rmsnorm_residual.cpp, both slots 1.33e-10), yet
+    // the walk's leaf gradients are now 3.2x too small per block, uniformly. So the question is not
+    // the formula but which terms reach it: `l1_dy` is the cotangent the norm differentiates,
+    // `l1_cot_res` the residual write's own incoming cotangent, and the last two what the row puts
+    // on the two slots. A `l1_cot_res` of zero (or a `dv` that cancels it) is the decay.
+    if (std::getenv("R97_GAIN_POS") != nullptr) {
+        const auto l1 = [](const AdValue* v) {
+            double s = 0.0;
+            if (v != nullptr)
+                for (double t : v->value) s += std::fabs(t);
+            return s;
+        };
+        std::fprintf(stderr,
+                     "SPLIT pos=%lld op=%s l1_dy=%.6g l1_cot_res=%.6g l1_dx=%.6g l1_dx_res=%.6g\n",
+                     (long long)call.rec.position, call.rec.op.c_str(), l1(&dy), l1(cot_res),
+                     l1(&dx), l1(dx_res));
+        std::fflush(stderr);
+    }
     // R97_GAIN_POS=1: the per-row scale both ways for a fused norm that has a residual. The row's
     // input cotangent is `s = 1/rms(input)` to first order, so a wrong input scales every per-norm
     // cotangent by the rms ratio between the branch (operand 0) and the residual (operand 1), and
