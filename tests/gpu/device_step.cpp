@@ -913,13 +913,15 @@ void card_case(const char* test, int64_t n, bool probe) {
 
     // One AdamW step off the gradient, at the config's default lr, weight decay 0: a zero
     // gradient leaves its parameter bit-identical, and a nonzero one moves it. The same step at
-    // smaller lrs is a forward-only probe each: the walk's gradient is finite but its norm is
-    // ~1e38 on this checkpoint, so a default-lr step that overshoots leaves the descent up while
-    // a smaller one still goes down -- which separates a wrong direction from a step too large
-    // without paying a second backward.
+    // smaller lrs is a forward-only probe each: the walk's gradient is finite but its norm was
+    // ~1e38 before the residual-operand and boundary fixes, so a default-lr step that overshoots
+    // leaves the descent up while a smaller one still goes down -- which separates a wrong
+    // direction from a step too large without paying a second backward. The ladder now runs down
+    // to 1e-7: at that size AdamW's first step is ~lr*sign(g), so |dL|/lr estimates the gradient's
+    // L1 directly and must stop growing as lr falls -- the scale check that needs no FD.
     const r97::ParamSet before = params;
     constexpr float kDefaultLr = 1e-3f;
-    constexpr float kProbeLrs[] = {3e-4f, 1e-4f};
+    constexpr float kProbeLrs[] = {3e-4f, 1e-4f, 1e-5f, 1e-6f, 1e-7f};
     r97::AdamWConfig oc;
     oc.lr = kDefaultLr;
     r97::Optimiser opt(params, oc);
@@ -959,10 +961,12 @@ void card_case(const char* test, int64_t n, bool probe) {
         if (!popt.step(grads) || popt.updates_done() != 1) continue;
         lr_probes.push_back({lr, 0.0f, step(batch, probe, nullptr).loss});
     }
-    // The clipped probe: the gradient's norm is ~7.5e38, so AdamW's f32 v = (1-b2)*g^2 is Inf for
-    // every leaf above ~1.8e19 and that leaf's update is zero -- the unclipped probes test only
-    // the moderate leaves. The clip (norm 1, computed in double, rescaled in f32) runs before the
-    // moments, so the dominant leaves take a finite step and this descent tests their direction.
+    // The clipped probe: the gradient's norm was ~7.5e38 before the residual fixes, so AdamW's f32
+    // v = (1-b2)*g^2 was Inf for every leaf above ~1.8e19 and that leaf's update was zero -- the
+    // unclipped probes then tested only the moderate leaves. The clip (norm 1, computed in double,
+    // rescaled in f32) runs before the moments, so the dominant leaves take a finite step and this
+    // descent tests their direction. Kept because it is the only probe that would still exercise
+    // those leaves if the magnitude regressed.
     for (float lr : {kDefaultLr, 1e-4f}) {
         r97::ParamSet probe = before;
         r97::AdamWConfig poc;
@@ -982,9 +986,9 @@ void card_case(const char* test, int64_t n, bool probe) {
     const bool after_scored_same = after.scored == result.scored;
     const bool after_finite = std::isfinite(after.loss);
     // The default-lr step is printed and carried in the JSON; the check below is the direction at
-    // a step the gradient's scale admits. This checkpoint's gradient norm is ~1e38, so a 1e-3
-    // AdamW step overshoots (+25 at 512 tokens) while 1e-4 and 1e-5 descend (-54, -7): the
-    // config's lr is a training choice, the walk's direction is what these checks can hold.
+    // a step the gradient's scale admits. On this checkpoint's current gradient (norm 858.248) the
+    // 1e-3 step descends (-257.8) and every smaller probe descends harder, so the config's lr is a
+    // training choice and the walk's direction is what these checks hold.
     const bool descended_default_lr = after.loss < result.loss;
     bool descended_at_a_valid_step = false;
     for (const LrProbe& p : lr_probes)

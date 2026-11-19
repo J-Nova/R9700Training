@@ -534,6 +534,15 @@ forward), the host walk shares the machinery under suspicion, and the reference 
 fixture-scale. What is needed is a **single-block f64 reference at the real container's shapes** --
 a new instrument, and the honest next step rather than a number.
 
+**But the descent ladder is a scale check that needs neither.** AdamW's first step at a small enough
+lr is `~lr*sign(g)` whatever the forward does, so `|dL|/lr` estimates the gradient's L1 directly.
+The ladder is monotone in the wrong direction so far -- 7.80e6 at lr=1e-4, 2.47e6 at 3e-4, 2.58e5 at
+1e-3 -- which says every measured point is past the linear regime and the smallest still overshoots.
+The ladder now runs to 1e-7. If it plateaus below `sqrt(N)*858.248` the reported scale is consistent
+with the loss; if it keeps growing past that bound, the reported norm cannot be the gradient's. That
+is a **scale check, not a correctness check**: it can refute the magnitude, it cannot confirm the
+gradient.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
