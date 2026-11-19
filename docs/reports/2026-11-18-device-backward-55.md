@@ -345,6 +345,47 @@ block handoff still works -- the cotangent does reach the next block's attn norm
 -- but the ffn norm's slot, and with it the feedback the `add` half of the fusion owes that write,
 is dropped every block.
 
+**The constraint on any fix, stated before one is attempted.** The boundary store is not a mistake to
+be removed: it exists because the engine reuses its arena between ops, so an in-place read genuinely
+cannot be served from the live buffer and the stored copy is what the op consumed. The attn norm's
+residual read *is* served from that store, correctly. So the fix is **not** to repoint those read
+segments at the previous writer's version -- that would delete the boundary path and reintroduce
+whatever it was built for. It is to credit the writer's version **in addition** to
+`add_input_full`: the cotangent must both leave the block through `incoming` (as it does now) and
+land on the version the previous block's ffn norm wrote, so that write's slot carries its consumers'
+cotangent. Anything that moves the term rather than duplicating it will trade this decay for the
+growth the boundary path was introduced to stop.
+
+This is walk-side, so it is reachable from the host tier: `SPLIT` is a host-row print and reproduces
+the same `l1_cot_res = 0` on the host arm, and `tests/host/backward_compose.cpp` drives the walk core
+with a synthetic tape (`BoundaryNames::from(VectorTape)` + `StoredSnapshots` + `Seed`) in seconds. A
+fixture there should reproduce the missing back-credit, so the fix can be iterated without a GPU
+window each time; the GPU arm is then only for confirming it on the real container.
+
+**That fixture now exists and corrects the mechanism.** `tests/host/backward_resid_handoff.cpp` (own
+rows, `BoundaryNames` + `StoredSnapshots` + `Seed`, two `backward_block` calls joined by the join's
+own pick rule) reproduces the live pattern in seconds:
+
+```
+JOIN below=m l1=0.203692 | the residual input x left block B with l1=0.203692
+SPLIT pos=1 role=ffn l1_cot_res=0 (want the next block's residual cot l1=0.203692)
+SPLIT pos=0 role=attn l1_cot_res=0.0676224 (the in-block reader; control)
+```
+
+`JOIN below=m` is the defect in one token. **Both** boundary-sized buffers of the upper block leave
+it -- the residual `x` through `add_input_full` and the branch `m` -- and `pick_boundary` keeps the
+first in **name order** (`src/backward.cpp:1080-1083`: the inputs map iterates in op-name order). The
+block's carried cotangent therefore lands on the branch's write version, the ffn norm's residual
+write has no reader in the version graph, and its slot is exactly zero. The earlier reading of this
+section put the defect in the distribution's `seg.version < 0` routing; that routing is correct --
+the residual *does* leave the block -- and the loss is one step later, in which of the qualifying
+outputs the join chooses to carry.
+
+The test asserts the defect's observable (the ffn slot exactly zero, the attn slot non-zero, the
+boundary input non-zero), so it passes now and **fails once the pick is fixed**: the zero assertion
+becomes an equality against the block's residual input cotangent, printed as `want` above. That is
+the fix's acceptance test.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
