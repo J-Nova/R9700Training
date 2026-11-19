@@ -762,6 +762,22 @@ void card_case(const char* test, int64_t n, bool probe) {
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
     }
 
+    // ---- the walk-vs-walk arbiter: the same leaf's gradient as THIS arm computed it. Two computed
+    // gradients can be compared where a finite difference of a quantised loss cannot -- the real
+    // container's central difference swings 948.917 -> 152.981 for a 4x larger eps, so it is a
+    // quantisation flip over 2*eps and no ratio can be formed from it (docs/reports/
+    // 2026-11-18-device-backward-55.md, "The reference is not a derivative"). Run the device arm
+    // and then the host arm (R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=1) with the same R97_DUMP_LEAF.
+    if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
+        bool found = false;
+        for (const r97::Param& c : grads)
+            if (c.name == leaf && !c.value.empty()) {
+                std::printf("%s: LEAF %s grad=%.9g\n", test, c.name.c_str(), c.value[0]);
+                found = true;
+            }
+        if (!found) std::printf("%s: LEAF %s absent from this arm's gradients\n", test, leaf);
+    }
+
     // ---- the central difference, only when asked: R97_CENTRAL=1. Perturbs one LoRA weight by a
     // small relative eps and re-forwards, so the loss's own sensitivity to that weight is
     // measured -- the number that settles whether the walk's ~1e37-magnitude gradient is the true
