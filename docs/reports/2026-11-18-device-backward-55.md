@@ -497,6 +497,30 @@ returns from its own arm -- before the device walk's block -- and its gradients 
 never `grads`. A print placed after that return therefore reports the *device* value in both runs:
 two identical numbers, indistinguishable from agreement. The labels exist so that cannot recur.
 
+### The two walks agree: the device backward is not the difference
+
+`R97_DUMP_LEAF` prints the same leaf from both arms in one run:
+
+| arm | `model.layers.63.self_attn.q_proj.lora_A` |
+|---|---|
+| device (walk arm, 306.0 s) | 4.33921814e-05 |
+| host (host arm, top block only, 172.9 s) | 4.31380649e-05 |
+
+They agree to **0.59%**. The host walk is the path the host tier finite-differences on models
+where FD is valid, and both arms are finite (host: 800 of 800 leaves, norm 4.07642). So the
+discriminator resolves in the direction that clears the device backward: **the device walk is not
+what differs.**
+
+What differs is the instrument. The real container's central difference is a quantisation flip over
+2*eps -- 948.917 at eps=1.14e-4 falling to 152.981 at 4.56e-4 -- so it cannot arbitrate a magnitude,
+and the `2.2e7x` shortfall computed against it was an artifact of an invalid reference, not a
+measurement of the walk.
+
+Criterion two therefore is **not** a device-walk defect. What remains genuinely open is whether
+`4.34e-05` is the checkpoint's true gradient at that leaf, and no finite difference on this
+container can answer it: it needs the f64 reference step (`src/reference_step.cpp`), which is a
+different piece of work from the device backward.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
