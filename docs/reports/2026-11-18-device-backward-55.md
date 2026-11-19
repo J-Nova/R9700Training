@@ -424,12 +424,39 @@ perturbations, `tests/host/step_host_oracle.cpp:261` matches it to `residual_gra
 criterion-two table above reads it. With two entries carried, "the first one" is the branch as often
 as not, which would have silently redefined all three.
 
-It selects the entry named by the **forward's own boundary record** (`BoundaryNames::from`, by
-boundary id), refusing by name when the walk left no cotangent for it. That correction came from the
-host tier, not from review: the first attempt used the block's first in-place read, which is right on
-the real container but wrong on every model with a rope, because a rope's in-place write is a read
-too -- the selection named `attn_qg` and eleven host cases refused. The forward's record has no such
-ambiguity; it is the same source the store itself is filled from.
+It selects the entry named by the **store's own record** (`ResidualStore::set_name`, filled at
+`keep()` time from the buffer `residual_bytes` recognised), refusing by name when the walk left no
+cotangent for it. Two earlier attempts were wrong and the host tier said so: the block's first
+in-place read is a rope's write on every model with a rope -- eleven cases refused, naming
+`attn_qg` -- and `BoundaryNames` is name-keyed, so a residual repeated at every boundary collapses
+to one id and answers `logits`. The store cannot disagree with itself about what it holds.
+
+### After the handoff fix: the boundary moves, the top block does not
+
+The 512 gate improved by 143x in magnitude, stayed finite, and every descent probe still descends
+and descends harder:
+
+| | before the handoff fix | after |
+|---|---|---|
+| grad norm | 5.98934 | 858.248 |
+| descent probes | -272.13, -387.26, -214.04, -334.80, -219.37 | -257.82, -741.63, -780.25, -258.80, -783.34 |
+| loss after one step | 7099.46 | 7113.77 |
+| step | 328.5 s | 311.3 s |
+
+The FD ladder separates two things the fix could not both address.
+
+**Block 0** (`linear_attn.in_proj_qkv.lora_A`): the walk's gradient moved from `7.6652e-32` to
+`0.898438`, so the handoff fix reaches the walk. Its central difference is not a usable arbiter
+though: at eps=1e-4 the loss moves 7381.51 -> 7396.38, a discrete 15-unit jump, so
+`central=-74358.9` is a quantisation or token flip rather than a derivative; at eps=1e-6 both
+central differences are exactly 0, below bf16's resolution. The walk's `0.898438` is neither
+confirmed nor refuted by this ladder.
+
+**Block 63** (`self_attn.q_proj.lora_A`): the walk is **unchanged** at `4.33922e-05` against
+`central=948.917`, a 2.2e7x shortfall. That is expected and diagnostic: block 63 is the top block,
+so its leaf gradient never crosses a boundary below it and no handoff change can move it. The
+shortfall is a defect **in the top block's own walk**, independent of the join -- and it is where
+criterion two now points.
 
 ## Tests
 
