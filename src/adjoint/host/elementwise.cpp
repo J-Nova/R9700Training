@@ -715,6 +715,26 @@ void rmsnorm_host_adjoint(const AdjointCall& call) {
                      l1(&dx), l1(dx_res));
         std::fflush(stderr);
     }
+    // R97_SPLIT_VALUES=<n>: the first n values of the two cotangents, round-trip exact. The L1 above
+    // says a term is missing; the values are what a single-block f64 reference has to be seeded with,
+    // so that comparison is about this block's rows and not about every layer above it (issue #55,
+    // criterion two). R97_SPLIT_POS gates it to one position, so one block's boundary can be dumped
+    // without the other 63 filling the log.
+    if (const char* nv = std::getenv("R97_SPLIT_VALUES")) {
+        const long long want = std::atoll(nv);
+        const char* only = std::getenv("R97_SPLIT_POS");
+        if (want > 0 && (only == nullptr || std::atoll(only) == (long long)call.rec.position)) {
+            std::fprintf(stderr, "SPLITVAL pos=%lld op=%s", (long long)call.rec.position,
+                         call.rec.op.c_str());
+            for (long long i = 0; i < want && i < (long long)dy.value.size(); ++i)
+                std::fprintf(stderr, " dy[%lld]=%.17g", i, dy.value[(size_t)i]);
+            for (long long i = 0; cot_res != nullptr && i < want &&
+                                 i < (long long)cot_res->value.size(); ++i)
+                std::fprintf(stderr, " res[%lld]=%.17g", i, cot_res->value[(size_t)i]);
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+    }
     // R97_GAIN_POS=1: the per-row scale both ways for a fused norm that has a residual. The row's
     // input cotangent is `s = 1/rms(input)` to first order, so a wrong input scales every per-norm
     // cotangent by the rms ratio between the branch (operand 0) and the residual (operand 1), and
