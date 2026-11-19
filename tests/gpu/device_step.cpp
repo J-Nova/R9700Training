@@ -407,6 +407,29 @@ void card_case(const char* test, int64_t n, bool probe) {
     r97::DeviceStepReport report;
     const r97::StepFn step = r97::device_step(*driver, model, options, &report);
 
+    // The walk-vs-walk arbiter's print: every gradient whose name contains R97_DUMP_LEAF, and the
+    // set's own norm. A substring, like the FD harness's find_w -- one leaf can be unrepresentative,
+    // and a block-wide spec (model.layers.63.) compares a whole block without a scope mismatch. The
+    // arm label matters: R97_HOST_WALK_AB=2 returns from its own arm and its gradients live in
+    // host_grads, never grads, so an unlabelled print reads as agreement.
+    const auto print_leaves = [&](const r97::ParamSet& set, const char* arm) {
+        const char* leaf = std::getenv("R97_DUMP_LEAF");
+        if (leaf == nullptr) return;
+        const std::string want(leaf);
+        int64_t n = 0;
+        double norm_sq = 0.0;
+        for (const r97::Param& g : set)
+            if (g.name.find(want) != std::string::npos && !g.value.empty()) {
+                double leaf_sq = 0.0;
+                for (float v : g.value) leaf_sq += double(v) * double(v);
+                norm_sq += leaf_sq;
+                ++n;
+                std::printf("%s: LEAF %s grad=%.9g (%s)\n", test, g.name.c_str(), g.value[0], arm);
+            }
+        std::printf("%s: LEAFSET %s leaves=%lld norm=%.9g (%s)\n", test, want.c_str(),
+                    (long long)n, std::sqrt(norm_sq), arm);
+    };
+
     // R97_HOST_WALK_AB=2: the host walk alone, first, for iterating on a host row that refuses a
     // record. The A/B below runs after the device step and only when that walk's gradient is not
     // finite, so a refusing host row otherwise costs a whole device walk -- minutes on the real
@@ -458,20 +481,10 @@ void card_case(const char* test, int64_t n, bool probe) {
                     (long long)host_report.first_non_finite_position,
                     (long long)host_report.first_non_finite_index,
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
-        // The walk-vs-walk arbiter's host value. This arm returns below, before the R97_DUMP_LEAF
-        // block that reads the device walk's `grads`, so without this print the arbiter would
-        // yield one number and read as agreement.
-        if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
-            bool found = false;
-            for (const r97::Param& g : host_grads)
-                if (g.name == leaf && !g.value.empty()) {
-                    std::printf("%s: LEAF %s grad=%.9g (host arm)\n", test, g.name.c_str(),
-                                g.value[0]);
-                    found = true;
-                }
-            if (!found)
-                std::printf("%s: LEAF %s absent from the host arm's gradients\n", test, leaf);
-        }
+        // The walk-vs-walk arbiter's host value. This arm returns below, before the print that
+        // reads the device walk's `grads`, so without this the arbiter yields one number and
+        // reads as agreement.
+        print_leaves(host_grads, "host arm");
         // The parent reads a results file whatever the child did, and this arm ran no device step
         // for it to assert on. The file carries the host walk's own numbers and a marker, so the
         // parent checks what this arm actually measured instead of reporting a missing file.
@@ -776,17 +789,7 @@ void card_case(const char* test, int64_t n, bool probe) {
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
         // The host arm's gradients are its own ParamSet, never `grads`: printing from `grads` here
         // would report the DEVICE value in both runs and read as perfect agreement.
-        if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
-            bool found = false;
-            for (const r97::Param& g : host_grads)
-                if (g.name == leaf && !g.value.empty()) {
-                    std::printf("%s: LEAF %s grad=%.9g (host arm)\n", test, g.name.c_str(),
-                                g.value[0]);
-                    found = true;
-                }
-            if (!found)
-                std::printf("%s: LEAF %s absent from the host arm's gradients\n", test, leaf);
-        }
+        print_leaves(host_grads, "host arm");
     }
 
     // ---- the walk-vs-walk arbiter: the same leaf's gradient as THIS arm computed it. Two computed
@@ -795,16 +798,7 @@ void card_case(const char* test, int64_t n, bool probe) {
     // quantisation flip over 2*eps and no ratio can be formed from it (docs/reports/
     // 2026-11-18-device-backward-55.md, "The reference is not a derivative"). Run the device arm
     // and then the host arm (R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=1) with the same R97_DUMP_LEAF.
-    if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
-        bool found = false;
-        for (const r97::Param& c : grads)
-            if (c.name == leaf && !c.value.empty()) {
-                std::printf("%s: LEAF %s grad=%.9g (walk arm)\n", test, c.name.c_str(),
-                            c.value[0]);
-                found = true;
-            }
-        if (!found) std::printf("%s: LEAF %s absent from this arm's gradients\n", test, leaf);
-    }
+    print_leaves(grads, "walk arm");
 
     // ---- the central difference, only when asked: R97_CENTRAL=1. Perturbs one LoRA weight by a
     // small relative eps and re-forwards, so the loss's own sensitivity to that weight is

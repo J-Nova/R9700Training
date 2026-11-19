@@ -491,6 +491,12 @@ finite-differences on models where FD is valid. Agreement with the device walk m
 what differs and the whole magnitude question is in the instrument; disagreement hands over a value
 to bisect the device walk against, which is far cheaper than probing it blind.
 
+The arbiter is `R97_DUMP_LEAF=<name>`: each arm prints its own leaf's gradient, labelled `(walk arm)`
+or `(host arm)`. Its failure mode is worth recording, because it is silent. `R97_HOST_WALK_AB=2`
+returns from its own arm -- before the device walk's block -- and its gradients live in `host_grads`,
+never `grads`. A print placed after that return therefore reports the *device* value in both runs:
+two identical numbers, indistinguishable from agreement. The labels exist so that cannot recur.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
