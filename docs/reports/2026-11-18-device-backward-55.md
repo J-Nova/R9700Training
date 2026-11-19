@@ -576,15 +576,19 @@ single-block f64 reference at the real container's shapes.
   `ops[block.begin .. block.end)`, because `Tape::Block` already carries the record indices
   (`src/join_common.h:357-359`, `block_wrote` walks exactly that range). What the reference step
   lacks is a way to *accept* a sub-program, not a way to find one.
-- **Missing (2)**: the device walk's *per-block* leaf gradients. `R97_DUMP_LEAF` prints the leaves
-  the walk reached, but the walk reaches the top block's leaves last; dumping a lower block's leaves
-  needs the same print gated on the block index, which `R97_WALK_BLOCKS` already names.
-- **Missing (3)**: a shared seed. The f64 block must start from the *device walk's* incoming
-  cotangent for that block, or the comparison is confounded by every layer above it. That is the same
-  choice the host-walk arbiter made, and it carries the same scope limit: it tests this block's rows
-  given the same input, not the whole walk.
-- **The first slice**: block 0 (or any block `R97_WALK_BLOCKS` can reach), one leaf, device vs f64.
-  That is the first comparison that covers a block *below* 63 and does not share the walk's join.
+- **Missing (2)** -- *also checked, also not missing*: `R97_DUMP_LEAF` takes a **substring** of the
+  leaf name, and a leaf is named `layers.N.self_attn...`, so `R97_DUMP_LEAF=layers.0.` prints block
+  0's leaves. The device walk reaches all 64 blocks (`R97_WALK_BLOCKS` truncates the *host* arm
+  only), so any block's leaves can be dumped today.
+- **Missing (3)**: the one real gap. The f64 block must start from the *device walk's* incoming
+  cotangent for that block, or the comparison is confounded by every layer above it. The SPLIT
+  instrumentation prints the cotangent's L1 but not its values, so this needs a value dump -- and it
+  carries the same scope limit as the host-walk arbiter: it tests this block's rows given the same
+  input, not the whole walk.
+- **The first slice**: one block below 63, one leaf, device vs f64. The leaf and the block's op list
+  both come from what exists; the new code is the block's incoming-cotangent dump and a runner that
+  accepts a sub-program. That is the first comparison that covers a block *below* 63 and does not
+  share the walk's join.
 
 The work is a real instrument, not a rerun, and it should start in a fresh context: the four
 negative results above are the specification, and re-deriving them costs a GPU window each.
