@@ -311,7 +311,9 @@ because the walk sizes an in-place frozen slot anyway, but it is misaligned with
 ### The remaining per-block factor is the residual handoff, not the row
 
 After the residual-operand fix the walk's cotangents decay ~x0.3 per block instead of growing ~x3.8
-(the FD ladder at blocks 63 and 0 puts the leaf 2.2e7x and ~1e39x too small, a uniform 3.2x/block).
+(the FD ladder at blocks 63 and 0 then read 2.2e7x and ~1e39x too small, a uniform 3.2x/block;
+**both ratios are retracted** in "The reference is not a derivative" below -- the FD reference on the
+real container is not a derivative, so no ratio can be formed from it).
 The row is not the cause: its split is proven against a finite difference of `v = x + residual_old`
 (both slots 1.33e-10) and the same-term A/B is refuted by that test -- `dc[0]` reads 0.247 with `g_r`
 off the branch slot. The live walk confirms the rule too: `l1_dx == l1_dx_res` at all eight fused
@@ -452,11 +454,10 @@ though: at eps=1e-4 the loss moves 7381.51 -> 7396.38, a discrete 15-unit jump, 
 central differences are exactly 0, below bf16's resolution. The walk's `0.898438` is neither
 confirmed nor refuted by this ladder.
 
-**Block 63** (`self_attn.q_proj.lora_A`): the walk is **unchanged** at `4.33922e-05` against
-`central=948.917`, a 2.2e7x shortfall. That is expected and diagnostic: block 63 is the top block,
-so its leaf gradient never crosses a boundary below it and no handoff change can move it. The
-shortfall is a defect **in the top block's own walk**, independent of the join -- and it is where
-criterion two now points.
+**Block 63** (`self_attn.q_proj.lora_A`): the walk is **unchanged** at `4.33922e-05` while the FD
+reference reads `948.917`. That the value did not move is expected and diagnostic: block 63 is the
+top block, so its leaf gradient never crosses a boundary below it and no handoff change can move it.
+Whether `4.33922e-05` is *wrong* is not established by this ladder -- see below.
 
 **The reference is not a derivative.** The third point settles it:
 
@@ -471,9 +472,13 @@ finite difference is dominated by something that shrinks with eps and `948.917` 
 derivative. The real container's forward is bf16 weights through an int8 path: it is piecewise
 constant at this scale, and no FD on it can arbitrate a magnitude.
 
-**The conclusion survives anyway.** Because the central falls as eps grows, the true gradient is at
-least 948.917, not below it -- so the walk's `4.33922e-05` is >=2.2e7x too small whatever the exact
-value. Criterion two is a genuine walk defect, not a reference artifact.
+**The ratio does not survive, and it must not drive the next step.** I first wrote that because the
+central falls as eps grows, the true gradient must be at least 948.917 and the walk therefore
+>=2.2e7x too small. That inference assumes a smooth, concave response; for a piecewise-constant
+forward it fails outright, because a single quantisation flip inside the interval scales the finite
+difference as 1/eps and says nothing about the derivative. So **the 2.2e7x shortfall at block 63 is
+retracted**: neither point is a derivative, no ratio can be formed from them, and criterion two is
+open and unmeasured at this leaf rather than refuted.
 
 That does mean the magnitude needs a different arbiter: a finite difference on a quantised forward
 cannot supply one. The candidate already in the tree is the **reference step** (`src/reference_step.cpp`),
