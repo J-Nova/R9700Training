@@ -458,6 +458,20 @@ void card_case(const char* test, int64_t n, bool probe) {
                     (long long)host_report.first_non_finite_position,
                     (long long)host_report.first_non_finite_index,
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
+        // The walk-vs-walk arbiter's host value. This arm returns below, before the R97_DUMP_LEAF
+        // block that reads the device walk's `grads`, so without this print the arbiter would
+        // yield one number and read as agreement.
+        if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
+            bool found = false;
+            for (const r97::Param& g : host_grads)
+                if (g.name == leaf && !g.value.empty()) {
+                    std::printf("%s: LEAF %s grad=%.9g (host arm)\n", test, g.name.c_str(),
+                                g.value[0]);
+                    found = true;
+                }
+            if (!found)
+                std::printf("%s: LEAF %s absent from the host arm's gradients\n", test, leaf);
+        }
         // The parent reads a results file whatever the child did, and this arm ran no device step
         // for it to assert on. The file carries the host walk's own numbers and a marker, so the
         // parent checks what this arm actually measured instead of reporting a missing file.
@@ -760,6 +774,19 @@ void card_case(const char* test, int64_t n, bool probe) {
                     (long long)host_report.first_non_finite_index,
                     host_report.first_non_finite_from_row ? 1 : 0,
                     host_report.forward_all_finite ? 1 : 0, host_seconds);
+        // The host arm's gradients are its own ParamSet, never `grads`: printing from `grads` here
+        // would report the DEVICE value in both runs and read as perfect agreement.
+        if (const char* leaf = std::getenv("R97_DUMP_LEAF")) {
+            bool found = false;
+            for (const r97::Param& g : host_grads)
+                if (g.name == leaf && !g.value.empty()) {
+                    std::printf("%s: LEAF %s grad=%.9g (host arm)\n", test, g.name.c_str(),
+                                g.value[0]);
+                    found = true;
+                }
+            if (!found)
+                std::printf("%s: LEAF %s absent from the host arm's gradients\n", test, leaf);
+        }
     }
 
     // ---- the walk-vs-walk arbiter: the same leaf's gradient as THIS arm computed it. Two computed
@@ -772,7 +799,8 @@ void card_case(const char* test, int64_t n, bool probe) {
         bool found = false;
         for (const r97::Param& c : grads)
             if (c.name == leaf && !c.value.empty()) {
-                std::printf("%s: LEAF %s grad=%.9g\n", test, c.name.c_str(), c.value[0]);
+                std::printf("%s: LEAF %s grad=%.9g (walk arm)\n", test, c.name.c_str(),
+                            c.value[0]);
                 found = true;
             }
         if (!found) std::printf("%s: LEAF %s absent from this arm's gradients\n", test, leaf);
