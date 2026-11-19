@@ -497,7 +497,7 @@ returns from its own arm -- before the device walk's block -- and its gradients 
 never `grads`. A print placed after that return therefore reports the *device* value in both runs:
 two identical numbers, indistinguishable from agreement. The labels exist so that cannot recur.
 
-### The two walks agree: the device backward is not the difference
+### The device rows agree with the host path at block 63 -- and that is all it says
 
 `R97_DUMP_LEAF` prints the same leaf from both arms in one run:
 
@@ -506,20 +506,21 @@ two identical numbers, indistinguishable from agreement. The labels exist so tha
 | device (walk arm, 306.0 s) | 4.33921814e-05 |
 | host (host arm, top block only, 172.9 s) | 4.31380649e-05 |
 
-They agree to **0.59%**. The host walk is the path the host tier finite-differences on models
-where FD is valid, and both arms are finite (host: 800 of 800 leaves, norm 4.07642). So the
-discriminator resolves in the direction that clears the device backward: **the device walk is not
-what differs.**
+They agree to 0.59%. The scope of that is narrow, and it matters more than the number:
 
-What differs is the instrument. The real container's central difference is a quantisation flip over
-2*eps -- 948.917 at eps=1.14e-4 falling to 152.981 at 4.56e-4 -- so it cannot arbitrate a magnitude,
-and the `2.2e7x` shortfall computed against it was an artifact of an invalid reference, not a
-measurement of the walk.
+- **It is one leaf in the top block.** Block 63 never crosses a boundary below it, so it was never
+  where the per-block decay localised. Blocks 0..62 are **unarbitrated** by this comparison, and the
+  host arm cannot reach them cheaply: `R97_WALK_BLOCKS` walks the top n blocks only.
+- **Both arms share the join, the head's seeds and `src/backward.cpp`** (`boundary_cotangents`,
+  `enter`, the version graph). A defect in any of those reproduces identically in both arms, so
+  agreement cannot clear the walk -- only the **device rows** at that leaf.
+- **The FD's 948.917 now disagrees with both arms.** Either the FD is unusable (established: it
+  swings 948.917 -> 152.981 for a 4x larger eps) or both arms share an error. This comparison cannot
+  separate those two possibilities.
 
-Criterion two therefore is **not** a device-walk defect. What remains genuinely open is whether
-`4.34e-05` is the checkpoint's true gradient at that leaf, and no finite difference on this
-container can answer it: it needs the f64 reference step (`src/reference_step.cpp`), which is a
-different piece of work from the device backward.
+So the honest statement is: **the device rows agree with the host path at block 63.** The magnitude
+is not thereby right, and criterion two is not thereby cleared. The separator is the f64 reference
+step (`src/reference_step.cpp`), not the host walk.
 
 ## Tests
 
