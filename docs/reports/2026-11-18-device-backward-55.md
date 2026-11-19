@@ -1,4 +1,4 @@
-# Device backward: the 512-token walk is finite with the right sign, the magnitude is still wrong; 4096 overflows at `gemm_nt_q`
+# Device backward: the walk is finite at 512 and 4096 with the right sign; the magnitude is still wrong at `gemm_nt_q`
 
 `2026-11-18`, issue #55.
 
@@ -104,23 +104,22 @@ block gain, not a top-block offset — and the candidate site.
 
 ## The 4096-token ticket case
 
-`device_step_seq4096` (zero-B start), same window harness: step **3610.2 s** (fwd 106.2,
-bwd 3494.5, head 6.4), store 5120 MiB, VRAM 21,422 MiB after load / **23,510 MiB peak**, loss
-34,682.089 → 50,870.029. The contract passes (the `StepFn` runs, the params keep their names and
-shapes, the forward is finite, the optimiser applied one update); the walk is **non-finite**:
-`all_finite 0`, first non-finite `gemm_nt_q`/`gdn_o.q8`[0] at position **690**, from the row.
-The per-op counts are in the log (`gemm_nt_q 271/288`, `lora_expand 405/288`, ...; the forward
-is finite).
+`device_step_seq4096` (zero-B start), same window harness, re-run on the fixed tree: step
+**3465.7 s** (fwd 105.6, bwd 3350.6, head 6.4), loss 34,682.089 -> **19,154.462** (mean NLL 8.469 ->
+4.678), `all_finite 1`, `non-finite: cotangent none | forward all finite | per op: (none)`. The
+case **passes**. It was non-finite before the residual-operand and boundary fixes -- `all_finite 0`,
+first non-finite `gemm_nt_q`/`gdn_o.q8`[0] at position **690**, and the loss moved *up* to 50,870.
 
-Why the range fallback does not reach it: `gemm_nt_q`'s `b` weight is plugin-private
-(`raw != nullptr`); the host row refuses a stored operand by name, so `src/backward.cpp`'s
-fallback keeps the device row, and that row's f32 output overflows at 4096's larger cotangent.
-The value checks stay gated: `n_a_finite_nonzero 0`, `n_b_finite_nonzero 204`, `n_zero_a 211`,
-`grad_norm` nan, and all five descent probes report the default's post-step loss because the
-gradient is non-finite. The restores still happen (`in_place_restores 63`; the case does not run
-the coverage probe, so `in_place_expected -1`). The next piece of work is the `gemm_nt_q` row's
-range — an f64 carry (or a per-row scale) for the activation cotangent and the staged weight
-gradient — not a change to the host fallback.
+**The magnitude does not.** `grad norm 1.25528e+36` -- the #145 growth artifact at 4096's larger
+cotangent -- and the descent ladder says so directly: lr=1e-3 gives -15,527.6 and lr=3e-4 gives
+-12,840.1, but lr=1e-4 gives **+2,913.2** and clipped lr=1e-4 gives **+1,437.9**. A gradient at 1e36
+is not a direction the loss can follow at any step; a smaller step going *up* while a larger one goes
+down is what a meaningless magnitude looks like. This is the 4096 face of the open magnitude
+question, not a new defect.
+
+The `gemm_nt_q` row's range remains the recorded piece for the *overflow* -- an f64 carry or a
+per-row scale for the activation cotangent and the staged weight gradient -- but the overflow no
+longer fires on this case, so that work is now about the magnitude rather than about finiteness.
 
 ## The per-block gain, against the full device walk
 
