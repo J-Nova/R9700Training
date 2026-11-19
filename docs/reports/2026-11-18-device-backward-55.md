@@ -522,6 +522,18 @@ So the honest statement is: **the device rows agree with the host path at block 
 is not thereby right, and criterion two is not thereby cleared. The separator is the f64 reference
 step (`src/reference_step.cpp`), not the host walk.
 
+**The separator I named does not exist at this scale.** `src/reference_step.cpp` is the *tiny
+fixture's* f64 step (`include/r97/reference_step.h:3`): its value path is `std::vector<double>` twins
+over a recorded program or one live host-kernel trace, with the container supplying the weights.
+Architecturally that is exactly the right instrument -- it is not the int8 path and not the kernels
+-- but it takes a whole model's program, so pointing it at this container means a 64-layer 27B f64
+walk on the CPU. It cannot arbitrate criterion two as it stands.
+
+So criterion two currently has **no available arbiter**: the FD ladder is invalid (a quantised
+forward), the host walk shares the machinery under suspicion, and the reference step is
+fixture-scale. What is needed is a **single-block f64 reference at the real container's shapes** --
+a new instrument, and the honest next step rather than a number.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
