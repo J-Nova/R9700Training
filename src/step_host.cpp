@@ -208,8 +208,14 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
         int64_t head_input_bytes = 0;
         for (const InputCotangent& in : head.inputs) head_input_bytes += value_bytes(in.value);
 
-        const InputCotangent* above = pick_boundary(head.inputs, tokens, meta.hidden);
-        if (!above) {
+        // Every buffer the head left on the boundary, as its own entry: the top block reads the
+        // residual in place and the branch as a plain read, and both cross the boundary, so both
+        // enter the top block at the version its last write produced.
+        std::vector<IncomingCotangent> incoming =
+            boundary_cotangents(head.inputs, ops,
+                                &blocks[static_cast<size_t>(measured.layers - 1)], tokens,
+                                meta.hidden);
+        if (incoming.empty()) {
             std::string dbg = "host step: the head walk left no cotangent on the final hidden; blocks=" +
                               std::to_string(blocks.size()) + " head_records=" +
                               std::to_string(head_records.size()) + " inputs=" +
@@ -225,8 +231,24 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             throw std::runtime_error(dbg);
         }
 
-        auto store_boundary = [&](int64_t boundary, const InputCotangent* in) {
-            if (!options.keep_boundaries || !in) return;
+        auto store_boundary = [&](int64_t boundary, const std::vector<IncomingCotangent>& cot,
+                                  const std::string& want) {
+            if (!options.keep_boundaries) return;
+            // The store holds the residual, and the report's boundary cotangent is that buffer's:
+            // the host tier FD-checks it against residual perturbations and the oracle matches it
+            // to the residual's gradient. Select the entry the block below reads in place, not
+            // whichever entry the walk listed first -- that is the branch as often as not.
+            const IncomingCotangent* in = nullptr;
+            if (!want.empty()) {
+                for (const IncomingCotangent& c : cot)
+                    if (c.buffer == want) in = &c;
+                if (!in)
+                    throw std::runtime_error("r97: the join: the boundary store holds '" + want +
+                                             "' but the walk left no cotangent for it");
+            } else if (!cot.empty()) {
+                in = &cot.front();
+            }
+            if (!in) return;
             measured.boundary_name[static_cast<size_t>(boundary)] = in->buffer;
             measured.boundary_cotangent[static_cast<size_t>(boundary)] = in->value;
             const uint16_t* value = store.at(boundary);
@@ -242,9 +264,7 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
             }
         };
 
-        store_boundary(measured.layers, above);
-        IncomingCotangent incoming{above->buffer, 0, tokens,
-                                   first_rows(*above, tokens, meta.hidden)};
+        store_boundary(measured.layers, incoming, store.name(measured.layers));
 
         LayerReplay replay(*driver.engine(), driver.tape(), store);
         for (int64_t layer = measured.layers - 1; layer >= 0; --layer) {
@@ -376,15 +396,19 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                 if (options.reference_head_split) mark_join_lora(rec);
             }
             BoundaryNames block_names;
-            block_names.add(incoming.buffer, 0, tokens);
+            std::set<std::string> external;
+            for (const IncomingCotangent& in : incoming) {
+                block_names.add(in.buffer, 0, tokens);
+                external.insert(in.buffer);
+            }
             // This block's own read sets, from the whole tape (src/join_common.h). Every block
             // record's consumer is a GEMM or a norm, so none is proven and every one keeps the
             // loud refusal; the map is built anyway so the rule lives in one place.
             const std::map<int64_t, std::vector<int64_t>> block_reads =
-                derive_read_sets(records, ops, snaps, {incoming.buffer});
+                derive_read_sets(records, ops, snaps, external);
             bo.read_rows = &block_reads;
             const BackwardResult walked = backward_block(records, snaps, block_names, {},
-                                                         {incoming}, bo);
+                                                         incoming, bo);
             // The join holds the whole block's snapshots while the walk copies one op out of them,
             // so what it holds at once is the store plus that one op, not the walk's figure alone.
             // `before` holds the last write of every buffer an op replaced in place, a second copy
@@ -399,18 +423,22 @@ StepFn host_step(ForwardDriver& driver, const Model& model, const HostStepOption
                 measured.peak_snapshot_op_bytes = op_bytes;
             }
             measured.all_snapshot_store_bytes += store_bytes;
+            int64_t incoming_bytes = 0;
+            for (const IncomingCotangent& in : incoming) incoming_bytes += value_bytes(in.value);
             measured.peak_cotangent_bytes = std::max(
                 measured.peak_cotangent_bytes,
-                head_input_bytes + value_bytes(incoming.value) +
-                    walked.report.peak_cotangent_bytes);
+                head_input_bytes + incoming_bytes + walked.report.peak_cotangent_bytes);
 
-            const InputCotangent* below = pick_boundary(walked.inputs, tokens, meta.hidden);
-            if (!below)
+            // Every buffer the walk left on the boundary, as its own entry for the block below;
+            // null at the bottom block, which has no consumer below it.
+            incoming = boundary_cotangents(
+                walked.inputs, ops,
+                layer > 0 ? &blocks[static_cast<size_t>(layer - 1)] : nullptr, tokens,
+                meta.hidden);
+            if (incoming.empty())
                 throw std::runtime_error("host step: layer " + std::to_string(layer) +
                                          " left no cotangent on its input boundary");
-            store_boundary(layer, below);
-            incoming = IncomingCotangent{below->buffer, 0, tokens,
-                                         first_rows(*below, tokens, meta.hidden)};
+            store_boundary(layer, incoming, store.name(layer));
         }
 
         // The split runs first: a fused weight's engine gradient is named after the container's

@@ -56,7 +56,7 @@ issue leaves the qk gaps to that family's issue.
 An operand the kernel also reads as it writes is marked in the issue record:
 `patches/training/0121-issue-inout-mark.patch` sets the mark for a `RAD_OPD_INOUT` operand, and
 `Tape` copies it into `Operand::in_place`. The walk reads it first where an op writes a buffer and
-reads the value it replaces in the same record (`in_place_read`, `src/backward.cpp`); the two
+reads the value it replaces in the same record (`in_place_read`, `include/r97/backward.h`); the two
 shapes the ops always have -- `rope`'s operand 0 and a `kv:` buffer no separate read names -- stay
 as the fallback for a record built from a program instead of the live tape. The mark is its own
 patch for the reason the repository's patches are one concern each: `0101` carries the observer,

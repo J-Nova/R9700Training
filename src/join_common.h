@@ -353,14 +353,43 @@ inline std::vector<double> first_rows(const InputCotangent& in, int64_t tokens, 
     return std::vector<double>(in.value.begin(), in.value.begin() + static_cast<ptrdiff_t>(n));
 }
 
-inline const InputCotangent* pick_boundary(const std::vector<InputCotangent>& inputs, int64_t tokens,
-                                           int64_t hidden) {
-    const InputCotangent* best = nullptr;
+// True when any record of the block wrote the buffer.
+inline bool block_wrote(const std::vector<OpRecord>& ops, const Tape::Block& block,
+                        const std::string& buffer) {
+    for (size_t i = block.begin; i < block.end; ++i)
+        for (const Operand& o : ops[static_cast<size_t>(i)].operands)
+            if (o.written && o.buffer == buffer) return true;
+    return false;
+}
+
+// The cotangents the block below enters, one per buffer the block above left on the boundary.
+// The walk's input cotangents are, by construction, the cotangents of every buffer the block
+// above consumed from below -- a read with no earlier writer in the block leaves through
+// `add_input_full` (src/backward.cpp) -- so the boundary is the upper walk's own input list
+// filtered to the boundary's shape: the residual (its in-place read) and the branch (a plain
+// read by the same fused norm) both qualify. No name- or shape-preference over what qualifies:
+// that pick carried the branch and dropped the residual's cotangent at every block.
+//
+// Each entry enters the block below at the version its last write produced (src/backward.cpp's
+// `enter`): the residual's entry credits the ffn norm's in-place write, the branch's entry the
+// mlp's write, so both writers' slots carry their consumers' cotangents. The entries keep the
+// walk's input order (the names are distinct there, so nothing is collected twice). A
+// boundary-shaped input the block below never wrote is a refusal by name: the block above
+// consumed a value the block below did not produce, and a silent drop is the defect this join
+// exists to remove. `next` names the block below's records; null at the walk's bottom, where the
+// list is the canary the caller checks for emptiness, as before.
+inline std::vector<IncomingCotangent> boundary_cotangents(
+    const std::vector<InputCotangent>& inputs, const std::vector<OpRecord>& ops,
+    const Tape::Block* next, int64_t tokens, int64_t hidden) {
+    std::vector<IncomingCotangent> out;
     for (const InputCotangent& in : inputs) {
         if (!residual_shape(in, tokens, hidden)) continue;
-        if (best == nullptr || in.value.size() > best->value.size()) best = &in;
+        if (next != nullptr && !block_wrote(ops, *next, in.buffer))
+            throw std::runtime_error("r97: the join: the boundary buffer '" + in.buffer +
+                                     "' the block above left was not written by the block below");
+        out.emplace_back(in.buffer, 0, tokens, first_rows(in, tokens, hidden));
     }
-    return best;
+    return out;
 }
 
 // A record names a whole engine buffer, but this step's op only touched `rows` of them, starting

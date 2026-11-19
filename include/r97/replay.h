@@ -85,6 +85,12 @@ public:
     // Boundaries are kept in order from 0; a gap or a repeat throws std::out_of_range, and a
     // null `data` std::invalid_argument.
     void keep(int64_t boundary, const void* data);
+    // The name of the buffer keep() copied out of. The report's boundary cotangent is defined as
+    // that buffer's -- the host tier finite-differences it against residual perturbations and the
+    // oracle matches it to the residual's gradient -- and the store is the only place that knows
+    // what it holds: a block's first in-place read is not a reliable name (a rope's write is one).
+    void set_name(int64_t boundary, const std::string& buffer);
+    std::string name(int64_t boundary) const;  // empty when the caller named none
     // Keep the second copy at `boundary`, beside the residual keep() took at the same boundary:
     // the buffer the block at that boundary reads as its second input, holding what the block
     // before it left there. Throws std::logic_error when the plan holds no extra at the boundary,
@@ -147,6 +153,7 @@ private:
     int64_t extras_kept_ = 0;  // the extra copies kept so far
     int64_t allocated_ = 0;    // bytes of the one allocation, card or pinned host
     std::vector<std::vector<uint16_t>> values_;
+    std::vector<std::string> names_;  // per boundary: the buffer keep() copied out of
     std::vector<const void*> sources_;
     std::vector<std::vector<uint16_t>> extra_values_;  // host; per boundary
     std::vector<const void*> extra_sources_;

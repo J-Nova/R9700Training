@@ -386,6 +386,51 @@ boundary input non-zero), so it passes now and **fails once the pick is fixed**:
 becomes an equality against the block's residual input cotangent, printed as `want` above. That is
 the fix's acceptance test.
 
+**How the fix chooses, as landed.** The carry is not a name or shape preference. The set is the
+upper walk's own input list (`BackwardResult::inputs`) filtered by the boundary-shape gate, and each
+entry is then checked against the block below: if the lower block **writes** that buffer, the carry
+is refused by name. That list is tape-derived and is exactly "the buffers the block above consumed
+from below", because every read with no earlier writer in the block leaves through
+`add_input_full` (`src/backward.cpp:1014-1032`). On this container family it is the residual **and**
+the branch.
+
+My first instruction -- "the buffers the next block's records read" -- was wrong, and the agent
+found it: the lower block never reads its own mlp output, it **writes** it; the branch is read by
+the upper block. A literal read-of-the-lower predicate yields `{residual}` alone and starves the
+branch, which is the regression the two-buffer rule exists to avoid.
+
+Both paths are now pinned by the test, which is what makes this safe to land: a reproducer that
+asserted only the residual would go green while the branch was zeroed.
+
+```
+JOIN below=m,x l1_m=0.203692 l1_x=0.203692
+SPLIT pos=1 role=ffn l1_dy=0.203692 l1_cot_res=0.203692 (want the residual cot l1=0.203692)
+SPLIT pos=0 role=attn l1_cot_res=0.271315 (the in-block reader; control)
+SPLIT pos=2 role=mlp l1_cot_m=0.203692 (want the branch cot l1=0.203692)
+```
+
+The ffn norm's residual write now receives block B's residual cotangent **element-wise** and its own
+`dy` is non-zero again; the mlp receives the branch cotangent; the attn control stays non-zero. The
+equalities are bit-exact f64 copies, no tolerance.
+
+Two shared-interface notes: `in_place_read` moved from `src/backward.cpp`'s anonymous namespace into
+`include/r97/backward.h:41-50`, so the walk's version graph and the join derive from one rule; and
+`store_boundary` now takes the whole vector and selects from it, since the boundary vector holds
+`IncomingCotangent` rather than `InputCotangent`.
+
+That selection matters more than it looks. `report.boundary_cotangent` is **defined** as the
+residual's cotangent: `tests/host/step_host_boundary.cpp:245` finite-differences it against residual
+perturbations, `tests/host/step_host_oracle.cpp:261` matches it to `residual_grad.<i>`, and the
+criterion-two table above reads it. With two entries carried, "the first one" is the branch as often
+as not, which would have silently redefined all three.
+
+It selects the entry named by the **forward's own boundary record** (`BoundaryNames::from`, by
+boundary id), refusing by name when the walk left no cotangent for it. That correction came from the
+host tier, not from review: the first attempt used the block's first in-place read, which is right on
+the real container but wrong on every model with a rope, because a rope's in-place write is a read
+too -- the selection named `attn_qg` and eleven host cases refused. The forward's record has no such
+ambiguity; it is the same source the store itself is filled from.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new

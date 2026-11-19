@@ -127,6 +127,18 @@ void ResidualStore::keep(int64_t boundary, const void* data) {
     sources_.push_back(data);
 }
 
+void ResidualStore::set_name(int64_t boundary, const std::string& buffer) {
+    if (boundary < 0) throw std::out_of_range("residual store names boundaries from zero");
+    if (names_.size() <= static_cast<size_t>(boundary))
+        names_.resize(static_cast<size_t>(boundary) + 1);
+    names_[static_cast<size_t>(boundary)] = buffer;
+}
+
+std::string ResidualStore::name(int64_t boundary) const {
+    if (boundary < 0 || static_cast<size_t>(boundary) >= names_.size()) return {};
+    return names_[static_cast<size_t>(boundary)];
+}
+
 void ResidualStore::keep_extra(int64_t boundary, const void* data) {
     if (!data) throw std::invalid_argument("the extra copy needs bytes to keep");
     if (!extra_at(boundary))
@@ -304,6 +316,7 @@ struct BoundaryRecorder::Impl {
     ResidualStore store;
     std::string name;
     std::string read_name;
+    std::string last_name;
     const void* last = nullptr;
     const void* last_extra = nullptr;
     const void* named_extra = nullptr;
@@ -349,6 +362,7 @@ struct BoundaryRecorder::Impl {
                                   c.bytes == (size_t)store.boundary_bytes();
             if (residual_bytes(o, c, store, name)) {
                 last = c.data;
+                last_name = o.buffer;
             } else if (o.written && named_bb) {
                 // The block's latest boundary-sized write that is not the residual, and the
                 // latest one under the name the block reads as its second input: the value the
@@ -375,11 +389,17 @@ struct BoundaryRecorder::Impl {
             named_seen = false;
             ext_read = false;
             // Boundary 0 is what ran before the first block: the embeddings.
-            if (b == 0 && last) store.keep(0, last);
+            if (b == 0 && last) {
+                store.keep(0, last);
+                store.set_name(0, last_name);
+            }
             return;
         }
         // The block's last residual write is boundary b + 1.
-        if (last) store.keep(b + 1, last);
+        if (last) {
+            store.keep(b + 1, last);
+            store.set_name(b + 1, last_name);
+        }
         if (store.extra_at(b + 1)) {
             // The extra copy at boundary b + 1 is the buffer the block after this one reads as
             // its second input. This block reads that same buffer (the arch's blocks share the
