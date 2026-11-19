@@ -679,7 +679,11 @@ void rmsnorm_quant_fp8_adjoint(const AdjointCall& call) {
     }
     if (dq != nullptr) add_fp8_codes(*dq, call.fwd[4], rows, geo, y.value, &d);
 
-    const AdValue* dres = cot_of(call, 0);
+    // The residual is operand 1 and it is the in-place one, so the walk's passthrough puts the
+    // write's cotangent there -- the same slot the i8g row fills. Reading operand 0 (`x`, a plain
+    // read nothing else writes) leaves this empty in practice and drops the accumulated residual
+    // cotangent entirely.
+    const AdValue* dres = cot_of(call, static_cast<size_t>(ires));
     std::vector<double> dres_out;
     if (has_residual && dres != nullptr) {
         if (dres->value.size() != d.size())
