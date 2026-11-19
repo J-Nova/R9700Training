@@ -572,8 +572,10 @@ single-block f64 reference at the real container's shapes.
 - **Exists**: the twins and the host adjoints run a program in f64 with the container's weights
   (`make_reference_step`, `src/reference_step.cpp`); `tools/dump_weight.cpp` reads any container
   tensor without a card; the walk's tape names every op, its operands and its buffer versions.
-- **Missing (1)**: a *per-block* op list. The reference step takes a whole model's program; a block's
-  slice is the tape's records between two residual boundaries, which the walk already computes.
+- **Missing (1)** -- *checked, and it is not missing*: a block's op list is
+  `ops[block.begin .. block.end)`, because `Tape::Block` already carries the record indices
+  (`src/join_common.h:357-359`, `block_wrote` walks exactly that range). What the reference step
+  lacks is a way to *accept* a sub-program, not a way to find one.
 - **Missing (2)**: the device walk's *per-block* leaf gradients. `R97_DUMP_LEAF` prints the leaves
   the walk reached, but the walk reaches the top block's leaves last; dumping a lower block's leaves
   needs the same print gated on the block index, which `R97_WALK_BLOCKS` already names.
