@@ -828,6 +828,19 @@ void card_case(const char* test, int64_t n, bool probe) {
             const double bm = step(batch, params, nullptr).loss;
             params[wi].value[0] = w0;
             const double cd_big = (bp - bm) / (2.0 * eps_big);
+            // A third step, ~4x the bf16-visible one: two points cannot tell a linear response
+            // from a lucky one, and a reference that is not in the linear regime is no arbiter for
+            // the walk's magnitude. Agreement across eps_big and eps_mid is what makes `central`
+            // usable; disagreement means the reference is the suspect, not the walk.
+            const double eps_mid = std::max(std::fabs(w0) * 4e-2, 1e-4);
+            params[wi].value[0] = (float)(w0 + eps_mid);
+            const double mp = step(batch, params, nullptr).loss;
+            params[wi].value[0] = (float)(w0 - eps_mid);
+            const double mm = step(batch, params, nullptr).loss;
+            params[wi].value[0] = w0;
+            const double cd_mid = (mp - mm) / (2.0 * eps_mid);
+            std::printf("%s: CENTRAL-MID %s eps=%.6g grad=%.6g central=%.6g mp=%.9g mm=%.9g\n",
+                        test, name.c_str(), eps_mid, g0, cd_mid, mp, mm);
             std::printf("%s: CENTRAL %s w=%.6g eps=%.6g grad=%.6g central=%.6g lp=%.9g lm=%.9g\n",
                         test, name.c_str(), w0, eps, g0, cd, lp, lm);
             std::printf("%s: CENTRAL-BF16 %s eps=%.6g grad=%.6g central=%.6g bp=%.9g bm=%.9g\n",
@@ -846,6 +859,8 @@ void card_case(const char* test, int64_t n, bool probe) {
                                            {"central", cd}, {"loss_plus", lp}, {"loss_minus", lm},
                                            {"eps_bf16", eps_big}, {"central_bf16", cd_big},
                                            {"loss_plus_bf16", bp}, {"loss_minus_bf16", bm},
+                                           {"eps_mid", eps_mid}, {"central_mid", cd_mid},
+                                           {"loss_plus_mid", mp}, {"loss_minus_mid", mm},
                                            {"control_loss", lc}, {"params_live", live}});
             // The single-block object stays the first measured block, so existing readers of
             // j["central"] keep working.

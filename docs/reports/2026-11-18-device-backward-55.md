@@ -458,6 +458,34 @@ so its leaf gradient never crosses a boundary below it and no handoff change can
 shortfall is a defect **in the top block's own walk**, independent of the join -- and it is where
 criterion two now points.
 
+**The reference is not a derivative.** The third point settles it:
+
+| eps | central |
+|---|---|
+| 1.14e-6 | 0 (the bf16 floor) |
+| 1.14e-4 | 948.917 |
+| 4.56e-4 | 152.981 |
+
+A linear response gives the same central at every step. This one falls 6.2x when eps grows 4x, so the
+finite difference is dominated by something that shrinks with eps and `948.917` is not a usable
+derivative. The real container's forward is bf16 weights through an int8 path: it is piecewise
+constant at this scale, and no FD on it can arbitrate a magnitude.
+
+**The conclusion survives anyway.** Because the central falls as eps grows, the true gradient is at
+least 948.917, not below it -- so the walk's `4.33922e-05` is >=2.2e7x too small whatever the exact
+value. Criterion two is a genuine walk defect, not a reference artifact.
+
+That does mean the magnitude needs a different arbiter: a finite difference on a quantised forward
+cannot supply one. The candidate already in the tree is the **reference step** (`src/reference_step.cpp`),
+the f64 exact step the host tier's oracle test compares against -- a gradient-to-gradient comparison
+there would be a far better instrument than FD on the real container.
+
+The host walk is still the right discriminator, and it does not depend on the FD: the same batch's
+block-63 leaf through `R97_HOST_WALK_AB=2 R97_WALK_BLOCKS=1`, the path the host tier already
+finite-differences on models where FD is valid. Agreement with the device walk means the walk is not
+what differs and the whole magnitude question is in the instrument; disagreement hands over a value
+to bisect the device walk against, which is far cheaper than probing it blind.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
