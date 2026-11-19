@@ -567,6 +567,26 @@ quantised forward), the host walk (shared machinery), the reference step (fixtur
 scale ladder (no linear regime). The remaining one is the only one that avoids all four -- a
 single-block f64 reference at the real container's shapes.
 
+### What that instrument needs, and what already exists
+
+- **Exists**: the twins and the host adjoints run a program in f64 with the container's weights
+  (`make_reference_step`, `src/reference_step.cpp`); `tools/dump_weight.cpp` reads any container
+  tensor without a card; the walk's tape names every op, its operands and its buffer versions.
+- **Missing (1)**: a *per-block* op list. The reference step takes a whole model's program; a block's
+  slice is the tape's records between two residual boundaries, which the walk already computes.
+- **Missing (2)**: the device walk's *per-block* leaf gradients. `R97_DUMP_LEAF` prints the leaves
+  the walk reached, but the walk reaches the top block's leaves last; dumping a lower block's leaves
+  needs the same print gated on the block index, which `R97_WALK_BLOCKS` already names.
+- **Missing (3)**: a shared seed. The f64 block must start from the *device walk's* incoming
+  cotangent for that block, or the comparison is confounded by every layer above it. That is the same
+  choice the host-walk arbiter made, and it carries the same scope limit: it tests this block's rows
+  given the same input, not the whole walk.
+- **The first slice**: block 0 (or any block `R97_WALK_BLOCKS` can reach), one leaf, device vs f64.
+  That is the first comparison that covers a block *below* 63 and does not share the walk's join.
+
+The work is a real instrument, not a rerun, and it should start in a fresh context: the four
+negative results above are the specification, and re-deriving them costs a GPU window each.
+
 ## Tests
 
 - Host tier serial (`ctest --test-dir build -L host`): **25/25**; the new
