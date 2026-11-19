@@ -679,11 +679,11 @@ void rmsnorm_quant_fp8_adjoint(const AdjointCall& call) {
     }
     if (dq != nullptr) add_fp8_codes(*dq, call.fwd[4], rows, geo, y.value, &d);
 
-    // The residual is operand 1 and it is the in-place one, so the walk's passthrough puts the
-    // write's cotangent there -- the same slot the i8g row fills. Reading operand 0 (`x`, a plain
-    // read nothing else writes) leaves this empty in practice and drops the accumulated residual
-    // cotangent entirely.
-    const AdValue* dres = cot_of(call, static_cast<size_t>(ires));
+    // `cot` is indexed by WRITE order, not schema order (include/r97/adjoint.h:76), and the twin
+    // writes residual first: residual=0, codes=1, scale=2, y=3. So write 0 is the residual, and
+    // write 1 -- which `dq` already consumed above -- is the codes. `ires` is a schema index and
+    // belongs to `fwd`/`dc` only.
+    const AdValue* dres = cot_of(call, 0);
     std::vector<double> dres_out;
     if (has_residual && dres != nullptr) {
         if (dres->value.size() != d.size())
